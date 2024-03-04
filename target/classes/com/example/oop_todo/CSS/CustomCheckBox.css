@@ -1,0 +1,19 @@
+#chkPriority:selected .mark {
+    -fx-background-color: #6c63ff;
+    -fx-shape: "M1.73,12.91 8.1,19.28 22.79,4.59 22.79,1.59 8.1,16.28 1.73,9.91";
+}
+
+/*Light Mode Style*/
+.chk-light-mode #chkPriority .box {
+    -fx-background-color: #E3E3E3;
+    -fx-border-color: #E3E3E3;
+    -fx-border-radius: 5;
+}
+
+/*Dark Mode Style*/
+.chk-dark-mode #chkPriority .box{
+    -fx-background-color: #818181;
+    -fx-border-color: #818181;
+    -fx-border-radius: 5;
+}
+
