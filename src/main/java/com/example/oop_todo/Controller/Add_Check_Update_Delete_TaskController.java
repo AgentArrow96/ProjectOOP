@@ -199,6 +199,8 @@ public class Add_Check_Update_Delete_TaskController extends Controller{
             setTaskList("C:\\Users\\ammar\\IdeaProjects\\ProjectOOP\\target\\classes\\com\\example\\oop_todo\\text_file\\tasks.txt");
         } catch(Exception e){
             System.out.println("ERROR HERE");
+
+            System.out.println("syukri");
         }
 
         System.out.println("at least it works");
