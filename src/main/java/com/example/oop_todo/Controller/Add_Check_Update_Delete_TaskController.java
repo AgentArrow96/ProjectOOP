@@ -196,9 +196,8 @@ public class Add_Check_Update_Delete_TaskController extends Controller{
     @FXML
     private void handleAddTaskAction(ActionEvent event) {
         try{
-            setTaskList("C:\\Users\\ammar\\Downloads\\NewestOOP\\OOP_ToDoy\\src\\main\\resources\\com\\example\\oop_todo\\text_file\\tasks.txt");
+            setTaskList("C:\\Users\\ammar\\IdeaProjects\\ProjectOOP\\target\\classes\\com\\example\\oop_todo\\text_file\\tasks.txt");
         } catch(Exception e){
-            System.out.println(e);
             System.out.println("ERROR HERE");
         }
 
