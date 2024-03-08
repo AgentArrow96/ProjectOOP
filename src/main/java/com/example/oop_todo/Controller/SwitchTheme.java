@@ -1,9 +1,11 @@
 package com.example.oop_todo.Controller;
 
+import javafx.collections.ObservableList;
 import javafx.fxml.FXML;
 import javafx.scene.control.Button;
 import javafx.scene.control.Label;
 import javafx.scene.control.ProgressBar;
+import javafx.scene.control.ScrollPane;
 import javafx.scene.image.Image;
 import javafx.scene.image.ImageView;
 import javafx.scene.layout.AnchorPane;
@@ -19,7 +21,8 @@ public class SwitchTheme extends Controller {
     public SwitchTheme(Label lblTitle, Button btnToday, Button btnImportant, Button btnPrevious,
                        Button btnSomeday, Button btnTrash, Button btnClear,
                        Button btnMode, Button btnAddTask, AnchorPane parent, VBox vboxSide,
-                       VBox vboxAppBar, ImageView myImageView, ProgressBar progressBar, ImageView tasklist)
+                       VBox vboxAppBar, ImageView myImageView, ProgressBar progressBar,
+                       VBox vboxTaskContainer, ScrollPane sclTaskList)
     {
         super.lblTitle = lblTitle;
         super.btnToday = btnToday;
@@ -35,7 +38,8 @@ public class SwitchTheme extends Controller {
         super.vboxAppBar = vboxAppBar;
         super.myImageView = myImageView;
         super.progressBar = progressBar;
-        super.tasklist = tasklist;
+        super.vboxTaskContainer = vboxTaskContainer;
+        super.sclTaskList = sclTaskList;
     }
 
     // Method to handle the switching to Light Theme on main_page.fxml
@@ -53,7 +57,13 @@ public class SwitchTheme extends Controller {
         int counter = 0;
         for (Button btn : buttons){
             btn.setStyle("-fx-background-color: " + _LightMode.getButtonColor());
-            btn.setTextFill(Color.web(_LightMode.getTertiaryFontColor()));
+            double fontSize = btn.getFont().getSize();
+
+            if (fontSize > 20) { // the current focused sidebar button ( 22.5 font size )
+                btn.setTextFill(Color.web(_LightMode.getSecondaryFontColor()));
+            } else {
+                btn.setTextFill(Color.web(_LightMode.getTertiaryFontColor()));
+            }
             setImageForButton(btn, imagePaths[counter]);
             counter++;
         }
@@ -63,8 +73,18 @@ public class SwitchTheme extends Controller {
         btnAddTask.setStyle("-fx-background-color: " + _LightMode.getButtonColor());
         btnAddTask.setTextFill(Color.web(_LightMode.getIconColor()));
         lblTitle.setTextFill(Color.web(_LightMode.getPrimaryFontColor()));
-        Image image = new Image(Objects.requireNonNull(getClass().getResourceAsStream("/com/example/oop_todo/icons/light_mode/no_task_illustration.png")));
-        tasklist.setImage(image);
+
+        // Assuming 'sclTaskList' is your ScrollPane and 'vboxTaskContainer' is your VBox
+        ObservableList<String> scrollPaneStyleClasses = sclTaskList.getStyleClass();
+        ObservableList<String> vboxStyleClasses = vboxTaskContainer.getStyleClass();
+
+        // Remove existing style classes
+        scrollPaneStyleClasses.removeIf(styleClass -> styleClass.startsWith("scl-"));
+        vboxStyleClasses.removeIf(styleClass -> styleClass.startsWith("vbox-"));
+
+        // Add new style classes based on the current mode
+        scrollPaneStyleClasses.add("scl-light-mode");
+        vboxStyleClasses.add("vbox-light-mode");
 
         // change the icon of mode button
         btnMode.setStyle("-fx-background-color: " + _LightMode.getAnchorPaneColor());
@@ -97,7 +117,13 @@ public class SwitchTheme extends Controller {
         int counter = 0;
         for (Button btn : buttons){
             btn.setStyle("-fx-background-color: " + _DarkMode.getButtonColor());
-            btn.setTextFill(Color.web(_DarkMode.getTertiaryFontColor()));
+            double fontSize = btn.getFont().getSize(); // get the current font size of the button object
+
+            if (fontSize > 20) { // the current focused sidebar button ( 22.5 font size )
+                btn.setTextFill(Color.web(_DarkMode.getSecondaryFontColor()));
+            } else {
+                btn.setTextFill(Color.web(_DarkMode.getTertiaryFontColor()));
+            }
             setImageForButton(btn, imagePaths[counter]); // user define method
             counter++;
         }
@@ -107,8 +133,18 @@ public class SwitchTheme extends Controller {
         btnAddTask.setStyle("-fx-background-color: " + _DarkMode.getButtonColor());
         btnAddTask.setTextFill(Color.web(_DarkMode.getIconColor()));
         lblTitle.setTextFill(Color.web(_DarkMode.getPrimaryFontColor()));
-        Image image = new Image(Objects.requireNonNull(getClass().getResourceAsStream("/com/example/oop_todo/icons/dark_mode/no_task_illustration(dark).png")));
-        tasklist.setImage(image);
+
+        // Assuming 'sclTaskList' is your ScrollPane and 'vboxTaskContainer' is your VBox
+        ObservableList<String> scrollPaneStyleClasses = sclTaskList.getStyleClass();
+        ObservableList<String> vboxStyleClasses = vboxTaskContainer.getStyleClass();
+
+        // Remove existing style classes
+        scrollPaneStyleClasses.removeIf(styleClass -> styleClass.startsWith("scl-"));
+        vboxStyleClasses.removeIf(styleClass -> styleClass.startsWith("vbox-"));
+
+        // Add new style classes based on the current mode
+        scrollPaneStyleClasses.add("scl-dark-mode");
+        vboxStyleClasses.add("vbox-dark-mode");
 
         // change the icon of mode button
         btnMode.setStyle("-fx-background-color: " + _DarkMode.getAnchorPaneColor());

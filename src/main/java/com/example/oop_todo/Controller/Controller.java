@@ -6,16 +6,14 @@ import javafx.fxml.FXML;
 import javafx.fxml.FXMLLoader;
 import javafx.scene.Parent;
 import javafx.scene.Scene;
-import javafx.scene.control.Button;
-import javafx.scene.control.Label;
-import javafx.scene.control.ProgressBar;
+import javafx.scene.control.*;
+import javafx.scene.image.Image;
 import javafx.scene.image.ImageView;
 import javafx.scene.layout.AnchorPane;
 import javafx.scene.layout.VBox;
 import javafx.scene.paint.Color;
 import javafx.scene.text.Font;
 import javafx.scene.text.FontWeight;
-import javafx.stage.Modality;
 import javafx.stage.Stage;
 import javafx.stage.StageStyle;
 
@@ -76,12 +74,23 @@ public class Controller {
 
     @FXML
     protected Button btnMode;
-
-    @FXML
-    protected ImageView tasklist;
-
     @FXML
     protected ImageView myImageView;
+
+    @FXML
+    protected VBox vboxTaskContainer;
+
+    @FXML
+    protected ScrollPane sclTaskList;
+
+    @FXML
+    private ImageView imgClose;
+
+    @FXML
+    private ImageView imgMax;
+
+    @FXML
+    private ImageView imgMin;
 
     // set the color scheme of light and dark theme
     protected final LightModeColorScheme _LightMode = new LightModeColorScheme();
@@ -97,31 +106,44 @@ public class Controller {
 
     // Invoke the method once main_page.fxml have been loaded in Main.java
     public void initialize() {
-        ButtonEffect(btnToday);
-        ButtonEffect(btnImportant);
-        ButtonEffect(btnPrevious);
-        ButtonEffect(btnSomeday);
-        ButtonEffect(btnTrash);
-        AppBarButtonEffect(btnClose);
-        AppBarButtonEffect(btnMin);
-        AppBarButtonEffect(btnMax);
+        // initialize the effect method for all the button in the program
+        SideBarButton_Effect(btnToday);
+        SideBarButton_Effect(btnImportant);
+        SideBarButton_Effect(btnPrevious);
+        SideBarButton_Effect(btnSomeday);
+        SideBarButton_Effect(btnTrash);
+        AppBarButton_Effect(btnClose);
+        AppBarButton_Effect(btnMin);
+        AppBarButton_Effect(btnMax);
         AddNewTaskButton_Effect(btnAddTask);
+        SwitchModeButton_Effect(btnMode);
+        ClearButton_Effect(btnClear);
 
         // put all the control that affected by the switchTheme method
         st = new SwitchTheme(lblTitle, btnToday, btnImportant, btnPrevious, btnSomeday, btnTrash, btnClear,
-                btnMode, btnAddTask, parent, vboxSide, vboxAppBar, myImageView, progressBar, tasklist);
+                btnMode, btnAddTask, parent, vboxSide, vboxAppBar, myImageView, progressBar,
+                vboxTaskContainer, sclTaskList);
     }
 
     // Method to handle hover effect of App Bar's circles button
-    protected void AppBarButtonEffect(Button button) {
+    protected void AppBarButton_Effect(Button button) {
         button.setOnMouseEntered(event -> {
-            if (isLightMode)
-                button.setStyle("-fx-border-width: 2; -fx-border-color: " +  _LightMode.getTertiaryFontColor() + ";");
-            else
-                button.setStyle("-fx-border-width: 2; -fx-border-color: " +  _DarkMode.getTertiaryFontColor() + ";");
+            if (button == btnClose) {
+                imgClose.setVisible(true);
+            } else if (button == btnMin) {
+                imgMin.setVisible(true);
+            } else {
+                imgMax.setVisible(true);
+            }
         });
         button.setOnMouseExited(event -> {
-            button.setStyle("-fx-border-width: 1; -fx-border-color: transparent;");
+            if (button == btnClose) {
+                imgClose.setVisible(false);
+            } else if (button == btnMin) {
+                imgMin.setVisible(false);
+            } else {
+                imgMax.setVisible(false);
+            }
         });
     }
 
@@ -132,7 +154,6 @@ public class Controller {
         // Selection statement for switching theme
         if (isLightMode){ // light mode theme
             st.setLightTheme();
-
         } else { // dark mode theme
             st.setDarkTheme();
         }
@@ -142,16 +163,80 @@ public class Controller {
     private void AddNewTaskButton_Effect(Button button){
         button.setOnMouseEntered(event -> { // Hover
             if (isLightMode)
-                button.setStyle("-fx-background-color: " + _LightMode.getButtonHoverColor());
+                button.setStyle("-fx-background-color: " + _LightMode.getButtonHoverColor() + ";");
             else
-                button.setStyle("-fx-background-color: " + _DarkMode.getButtonHoverColor());
+                button.setStyle("-fx-background-color: " + _DarkMode.getButtonHoverColor() + ";");
         });
         button.setOnMouseExited(event -> {
             if (isLightMode)
-                button.setStyle("-fx-background-color: " + _LightMode.getButtonColor());
+                button.setStyle("-fx-background-color: " + _LightMode.getButtonColor() + ";");
             else // dark mode
-                button.setStyle("-fx-background-color: " + _DarkMode.getButtonColor());
+                button.setStyle("-fx-background-color: " + _DarkMode.getButtonColor() + ";");
         });
+    }
+
+    private void SwitchModeButton_Effect(Button button){
+        button.setOnMouseEntered(event -> { // Hover
+            try {
+                if (isLightMode){ // light mode - black background, white icon
+                    button.setStyle("-fx-background-color: " + _DarkMode.getAnchorPaneColor() + ";");
+                    setImageForButton(button, "/com/example/oop_todo/icons/light_mode/dark(in_dark).png", 30);
+                }
+                if(!isLightMode){ // dark mode - white background, black icon
+                    button.setStyle("-fx-background-color: " + _LightMode.getAnchorPaneColor() + ";");
+                    setImageForButton(button, "/com/example/oop_todo/icons/dark_mode/light(in_light).png", 30);
+                }
+            } catch (Exception e){
+                e.printStackTrace();
+            }
+        });
+
+        button.setOnMouseExited(event -> {
+            try{
+                if (isLightMode){ // light mode - white background, black icon
+                    button.setStyle("-fx-background-color: " + _LightMode.getAnchorPaneColor() + ";");
+                    setImageForButton(button, "/com/example/oop_todo/icons/light_mode/dark(in_light).png",30);
+                }
+                if(!isLightMode){ // dark mode - black background, white icon
+                    button.setStyle("-fx-background-color: " + _DarkMode.getAnchorPaneColor() + ";");
+                    setImageForButton(button, "/com/example/oop_todo/icons/dark_mode/light(in_dark).png", 30);
+                }
+            } catch (Exception e){
+                e.printStackTrace();
+            }
+        });
+    }
+
+    private void ClearButton_Effect(Button button){
+        button.setOnMouseEntered(event -> { // Hover
+            button.setStyle("-fx-background-color: " + _LightMode.getIconColor() + ";");
+            button.setTextFill(Color.web("#DBDBDB"));
+            setImageForButton(button, "/com/example/oop_todo/icons/clear(hover).png", 40);
+        });
+        button.setOnMouseExited(event -> {
+            setImageForButton(button, "/com/example/oop_todo/icons/clear.png", 40);
+
+            if (isLightMode){
+                button.setStyle("-fx-background-color: " + _LightMode.getButtonColor() + ";");
+                button.setTextFill(Color.web(_LightMode.getSecondaryFontColor()));
+            }
+            else{ // dark mode
+                button.setStyle("-fx-background-color: " + _DarkMode.getButtonColor() + ";");
+                button.setTextFill(Color.web(_DarkMode.getSecondaryFontColor()));
+            }
+        });
+    }
+
+    private void setImageForButton(Button button, String imagePath, double size) {
+        try {
+            Image image = new Image(Objects.requireNonNull(getClass().getResourceAsStream(imagePath)));
+            ImageView imageView = new ImageView(image);
+            imageView.setFitWidth(size); // Adjust the width as needed
+            imageView.setFitHeight(size); // Adjust the height as needed
+            button.setGraphic(imageView);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
     }
 
     // Method to display the addNewTask.fxml form
@@ -182,7 +267,7 @@ public class Controller {
     }
 
     // Method to handle button hover effects and change the style
-    private void ButtonEffect(Button button) { //when mouse enter and exit --> color changed
+    private void SideBarButton_Effect(Button button) { //when mouse enter and exit --> color changed
         button.setOnMouseEntered(event -> { //Hover
             if (isLightMode)
                 button.setStyle("-fx-background-color: " + _LightMode.getButtonHoverColor());
@@ -208,7 +293,7 @@ public class Controller {
             button.setGraphicTextGap(25);
 
             // change font size, color of focused button
-            button.setFont(Font.font("System", FontWeight.BOLD, 22));
+            button.setFont(Font.font("Inter Semi Bold", FontWeight.BOLD, 22));
 
             // check the current color theme
             if (isLightMode)
