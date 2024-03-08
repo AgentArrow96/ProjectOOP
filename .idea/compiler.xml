@@ -9,9 +9,5 @@
         <module name="OOP_ToDoy" />
       </profile>
     </annotationProcessing>
-    <bytecodeTargetLevel>
-      <module name="OOP_ToDoy (1)" target="21" />
-      <module name="OOP_ToDoy (2)" target="21" />
-    </bytecodeTargetLevel>
   </component>
 </project>
