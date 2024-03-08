@@ -8,6 +8,7 @@ import javafx.scene.layout.Region;
 import javafx.scene.layout.VBox;
 import javafx.scene.paint.Color;
 import javafx.stage.Stage;
+import java.time.LocalDate;
 
 public class Add_Check_Update_Delete_TaskController extends Controller{
     @FXML
@@ -184,6 +185,51 @@ public class Add_Check_Update_Delete_TaskController extends Controller{
         // Close the stage
         stage.close();
     }
+
+
+    private TaskList taskList;
+    // Method to set TaskList, call this from the main application controller
+    public void setTaskList(String filename) {
+        this.taskList = new TaskList(filename);
+    }
+    // This method is called when the "Add New" button is clicked
+    @FXML
+    private void handleAddTaskAction(ActionEvent event) {
+        try{
+            setTaskList("C:\\Users\\ammar\\Downloads\\NewestOOP\\OOP_ToDoy\\src\\main\\resources\\com\\example\\oop_todo\\text_file\\tasks.txt");
+        } catch(Exception e){
+            System.out.println(e);
+            System.out.println("ERROR HERE");
+        }
+
+        System.out.println("at least it works");
+        // Get the task details from the form
+        String title = txtTitle.getText();
+        String description = txtDescription.getText();
+        LocalDate dueDate = dpDueDate.getValue();
+        boolean isPriority = chkPriority.isSelected();
+
+        if (this.taskList == null) {
+            // TaskList has not been initialized, handle this case appropriately
+            System.err.println("TaskList is not initialized.");
+            return;
+        }
+        else {
+            // Add the new task to the task list which will create a new Task object with a unique ID
+            taskList.addTask(title, description, dueDate, isPriority);
+
+            // Optionally, you can clear the form fields after adding the task
+            txtTitle.clear();
+            txtDescription.clear();
+            dpDueDate.setValue(null); // or set to a default value
+            chkPriority.setSelected(false);
+
+            // Close the dialog or update the view as needed
+            // ...
+        }
+    }
+
+
 
 }
 
