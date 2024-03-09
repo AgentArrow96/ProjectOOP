@@ -68,7 +68,7 @@
                         <RowConstraints maxHeight="24.0" minHeight="0.0" prefHeight="0.0" vgrow="SOMETIMES" />
                     </rowConstraints>
                     <children>
-                        <Button fx:id="btnOK" mnemonicParsing="false" prefHeight="25.0" prefWidth="95.0" style="-fx-background-color: #6C63FE; -fx-background-radius: 5;" text="Add New" textFill="WHITE" GridPane.columnIndex="1" GridPane.rowIndex="1">
+                        <Button fx:id="btnOK" mnemonicParsing="false" onAction="#handleAddTaskAction" prefHeight="25.0" prefWidth="95.0" style="-fx-background-color: #6C63FE; -fx-background-radius: 5;" text="Add New" textFill="WHITE" GridPane.columnIndex="1" GridPane.rowIndex="1">
                             <font>
                                 <Font name="inter semi bold" size="12.0" />
                             </font>
