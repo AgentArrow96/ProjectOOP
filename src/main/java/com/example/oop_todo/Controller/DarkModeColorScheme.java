@@ -44,6 +44,4 @@ public class DarkModeColorScheme {
 
     public String getFieldColor(){ return "#3F3F3F"; }
 
-    public String getTaskPane(){ return "#3F3F3F"; }
-
 }
