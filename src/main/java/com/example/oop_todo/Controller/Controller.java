@@ -9,8 +9,10 @@ import javafx.scene.Scene;
 import javafx.scene.control.Button;
 import javafx.scene.control.Label;
 import javafx.scene.control.ProgressBar;
+import javafx.scene.control.ScrollPane;
 import javafx.scene.image.ImageView;
 import javafx.scene.layout.AnchorPane;
+import javafx.scene.layout.Pane;
 import javafx.scene.layout.VBox;
 import javafx.scene.paint.Color;
 import javafx.scene.text.Font;
@@ -106,6 +108,7 @@ public class Controller {
         AppBarButtonEffect(btnMin);
         AppBarButtonEffect(btnMax);
         AddNewTaskButton_Effect(btnAddTask);
+        vboxTaskContainer.setPadding(new javafx.geometry.Insets(20));
 
         // put all the control that affected by the switchTheme method
         st = new SwitchTheme(lblTitle, btnToday, btnImportant, btnPrevious, btnSomeday, btnTrash, btnClear,
@@ -154,10 +157,19 @@ public class Controller {
         });
     }
 
+    private static int counter = 0;
+
+    @FXML
+    private VBox vboxTaskContainer;
+
+    @FXML
+    private ScrollPane scrTask;
+
     // Method to display the addNewTask.fxml form
     @FXML
-    private void onClickAddNewTask(ActionEvent event) throws IOException{
+    private void onClickAddNewTask(ActionEvent event) throws IOException {
         // load the addNewTask.fxml form
+        /*
         Parent form = FXMLLoader.load(Objects.requireNonNull(getClass().getResource("/com/example/oop_todo/fxml/addNewTask.fxml")));
         Stage stage = new Stage();
         Scene scene = new Scene(form);
@@ -179,6 +191,30 @@ public class Controller {
         stage.setResizable(false);
         stage.setAlwaysOnTop(true);
         stage.show();
+        */
+        try {
+            // Load the custom control from custom.fxml
+            FXMLLoader loader = new FXMLLoader(getClass().getResource("/com/example/oop_todo/fxml/task_bar.fxml"));
+
+            // set the root control (Pane) of Custom Control to be the loaded UI
+            Pane customControl = loader.load();
+
+            counter++;
+            // Access the CustomController instance
+            TaskBarController customController = loader.getController();
+
+            // Access lblTitle using the getter
+            customController.setlblTitle(counter);
+
+            // Set spacing for the custom control before added into the vbox
+            vboxTaskContainer.setSpacing(10);
+
+            // Add the custom control to the VBox
+            vboxTaskContainer.getChildren().add(customControl);
+        } catch (IOException e) {
+            e.printStackTrace();
+            // Handle the exception (e.g., show an error message)
+        }
     }
 
     // Method to handle button hover effects and change the style
