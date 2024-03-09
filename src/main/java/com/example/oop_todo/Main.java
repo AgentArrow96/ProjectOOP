@@ -10,11 +10,9 @@ import javafx.stage.Stage;
 import javafx.stage.StageStyle;
 
 import java.util.Objects;
-import java.util.*;
 
 public class Main extends Application {
     double x, y = 0;
-
     @Override
     public void start(Stage stage) throws Exception {
         Parent root = FXMLLoader.load(Objects.requireNonNull(getClass().getResource("/com/example/oop_todo/fxml/main_page.fxml"))); 
@@ -46,4 +44,5 @@ public class Main extends Application {
     public static void main(String[] args) {
         launch();
     }
+
 }
