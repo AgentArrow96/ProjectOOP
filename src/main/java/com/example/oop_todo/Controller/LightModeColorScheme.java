@@ -44,6 +44,4 @@ public class LightModeColorScheme {
 
     public String getFieldColor(){ return "#E3E3E3"; }
 
-    public String getTaskPane(){ return "#FBFBFB"; }
-
 }

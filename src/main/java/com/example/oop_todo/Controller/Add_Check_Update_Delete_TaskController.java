@@ -3,7 +3,6 @@ package com.example.oop_todo.Controller;
 import javafx.event.ActionEvent;
 import javafx.fxml.FXML;
 import javafx.scene.control.*;
-import javafx.scene.image.ImageView;
 import javafx.scene.layout.AnchorPane;
 import javafx.scene.layout.Region;
 import javafx.scene.layout.VBox;
@@ -53,9 +52,6 @@ public class Add_Check_Update_Delete_TaskController extends Controller{
     @FXML
     private VBox vboxFormAppBar;
 
-    @FXML
-    private ImageView imgCloseOnForm;
-
     // set the color scheme of light and dark theme
     private final LightModeColorScheme _LightMode = new LightModeColorScheme();
     private final DarkModeColorScheme _DarkMode = new DarkModeColorScheme();
@@ -63,25 +59,16 @@ public class Add_Check_Update_Delete_TaskController extends Controller{
     // Method handle the initial properties once the fxml being load
     public void initialize(){ // called the function once addNewTask.fxml have been loaded
         InheritMainPageTheme();
-        CloseButton_Effect(btnCloseOnForm);
+        super.AppBarButtonEffect(btnCloseOnForm);
     }
 
     // Method to inherit the current Color Theme from main_page.fxml
-    private void InheritMainPageTheme(){
+    public void InheritMainPageTheme(){
         if (isLightMode){
             setLightTheme();
         }else{
             setDarkTheme();
         }
-    }
-
-    private void CloseButton_Effect(Button button){
-        button.setOnMouseEntered(event -> {
-            imgCloseOnForm.setVisible(true);
-        });
-        button.setOnMouseExited(event -> {
-            imgCloseOnForm.setVisible(false);
-        });
     }
 
     // Method to handle switch of form to Light Theme
@@ -118,7 +105,7 @@ public class Add_Check_Update_Delete_TaskController extends Controller{
 
         chkPriority.setTextFill(Color.web(_LightMode.getPrimaryFontColor()));
         parent.getStyleClass().clear();
-        chkPriority.getStyleClass().add("light-mode");
+        parent.getStyleClass().add("chk-light-mode");
 
         dpDueDate.setStyle("-fx-control-inner-background: "+ _LightMode.getFieldColor());
         parent.getStyleClass().clear();
@@ -170,7 +157,7 @@ public class Add_Check_Update_Delete_TaskController extends Controller{
 
         chkPriority.setTextFill(Color.web(_DarkMode.getPrimaryFontColor()));
         parent.getStyleClass().clear();
-        chkPriority.getStyleClass().add("dark-mode");
+        parent.getStyleClass().add("chk-dark-mode");
 
         dpDueDate.setStyle("-fx-control-inner-background: "+ _DarkMode.getFieldColor());
         parent.getStyleClass().clear();
@@ -191,6 +178,7 @@ public class Add_Check_Update_Delete_TaskController extends Controller{
     // Method to handle the close of form
     @FXML
     private void onCloseButtonClick(ActionEvent event) {
+
         // Get the stage associated with the button
         Stage stage = (Stage) btnCloseOnForm.getScene().getWindow();
         // Close the stage

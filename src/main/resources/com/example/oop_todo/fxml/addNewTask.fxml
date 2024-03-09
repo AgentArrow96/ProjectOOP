@@ -30,8 +30,8 @@
                                     <ColumnConstraints hgrow="SOMETIMES" maxWidth="423.0" minWidth="10.0" prefWidth="144.0" />
                                 </columnConstraints>
                                 <rowConstraints>
-                                    <RowConstraints maxHeight="15.999997186660767" minHeight="4.200003051757811" prefHeight="10.0" vgrow="SOMETIMES" />
-                                    <RowConstraints maxHeight="24.0" minHeight="4.000002813339233" prefHeight="24.0" vgrow="SOMETIMES" />
+                                    <RowConstraints maxHeight="15.999997186660767" minHeight="4.200003051757811" prefHeight="15.999997186660767" vgrow="SOMETIMES" />
+                                    <RowConstraints maxHeight="22.39999084472656" minHeight="4.000002813339233" prefHeight="19.200006103515626" vgrow="SOMETIMES" />
                                     <RowConstraints maxHeight="23.59999694824219" minHeight="10.0" prefHeight="12.799993896484374" vgrow="SOMETIMES" />
                                 </rowConstraints>
                                 <children>
@@ -45,17 +45,10 @@
                               <Image url="@../icons/ToDoy(puppy).png" />
                            </image>
                         </ImageView>
-                        <Button fx:id="btnCloseOnForm" graphicTextGap="0.0" maxHeight="-Infinity" maxWidth="-Infinity" minHeight="8.0" minWidth="8.0" mnemonicParsing="false" onAction="#onCloseButtonClick" prefHeight="15.0" prefWidth="16.0" style="-fx-background-radius: 100; -fx-background-color: #ff605c; -fx-border-radius: 100;" translateX="30.0" GridPane.rowIndex="1">
+                        <Button fx:id="btnCloseOnForm" graphicTextGap="0.0" maxHeight="-Infinity" maxWidth="-Infinity" minHeight="8.0" minWidth="8.0" mnemonicParsing="false" onAction="#onCloseButtonClick" prefHeight="13.0" prefWidth="14.5" style="-fx-background-radius: 100%; -fx-background-color: #ff605c;" translateX="30.0" GridPane.rowIndex="1">
                            <font>
                               <Font size="7.0" />
                            </font>
-                           <graphic>
-                              <ImageView fx:id="imgCloseOnForm" fitHeight="11.0" fitWidth="14.0" pickOnBounds="true" preserveRatio="true" translateY="1.0" visible="false">
-                                 <image>
-                                    <Image url="@../icons/close.png" />
-                                 </image>
-                              </ImageView>
-                           </graphic>
                         </Button>
                                 </children>
                             </GridPane>
