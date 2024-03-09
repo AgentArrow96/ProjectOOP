@@ -227,9 +227,9 @@
                                       <Image url="@../icons/light_mode/no_task_illustration.png" />
                                   </image>
                               </ImageView>
-                        <ScrollPane fx:id="scrTask" hbarPolicy="NEVER" maxHeight="-Infinity" maxWidth="-Infinity" minHeight="-Infinity" minWidth="-Infinity" prefHeight="413.0" prefWidth="632.0" translateX="27.0">
+                        <ScrollPane hbarPolicy="NEVER" maxHeight="-Infinity" maxWidth="-Infinity" minHeight="-Infinity" minWidth="-Infinity" prefHeight="413.0" prefWidth="632.0" translateX="27.0">
                            <content>
-                              <VBox fx:id="vboxTaskContainer" alignment="TOP_CENTER" prefHeight="414.0" prefWidth="617.0" style="-fx-background-color: #fbfbfb;" />
+                              <VBox prefHeight="477.0" prefWidth="686.0" style="-fx-background-color: #979797;" />
                            </content>
                         </ScrollPane>
                      </children>
