@@ -1,28 +1,19 @@
 #chkPriority:selected .mark {
     -fx-background-color: #6c63ff;
-    -fx-shape: "M20.285 2l-11.285 11.567-5.286-5.011-3.714 3.716 9 8.728 15-15.285z"; /* custom .svg path */
+    -fx-shape: "M1.73,12.91 8.1,19.28 22.79,4.59 22.79,1.59 8.1,16.28 1.73,9.91";
 }
 
 /*Light Mode Style*/
-#chkPriority.light-mode .box{
-    -fx-background-color: #e3e3e3;
-    -fx-border-color: #e3e3e3;
-
-    -fx-min-width: 20px; /* Set the minimum width of the box */
-    -fx-min-height: 20px; /* Set the minimum height of the box */
-    -fx-max-width: 20px; /* Set the maximum width of the box */
-    -fx-max-height: 20px; /* Set the maximum height of the box */
+.chk-light-mode #chkPriority .box {
+    -fx-background-color: #E3E3E3;
+    -fx-border-color: #E3E3E3;
+    -fx-border-radius: 5;
 }
 
 /*Dark Mode Style*/
-#chkPriority.dark-mode .box{
-    -fx-background-color: #3F3F3F;
-    -fx-border-color: #3F3F3F;
+.chk-dark-mode #chkPriority .box{
+    -fx-background-color: #818181;
+    -fx-border-color: #818181;
     -fx-border-radius: 5;
-
-    -fx-min-width: 20px; /* Set the minimum width of the box */
-    -fx-min-height: 20px; /* Set the minimum height of the box */
-    -fx-max-width: 20px; /* Set the maximum width of the box */
-    -fx-max-height: 20px; /* Set the maximum height of the box */
 }
 
