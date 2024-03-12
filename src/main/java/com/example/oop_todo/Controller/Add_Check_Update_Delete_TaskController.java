@@ -75,26 +75,26 @@ public class Add_Check_Update_Delete_TaskController extends Controller{
     // Method to handle switch of form to Light Theme
     private void setLightTheme(){
         vboxFormAppBar.setStyle(
-            "-fx-background-radius: 12 12 0 0;"+
-            "-fx-border-radius: 12 12 0 0;" +
-           "-fx-background-color: " + _LightMode.getAppBarColor()
+                "-fx-background-radius: 12 12 0 0;"+
+                        "-fx-border-radius: 12 12 0 0;" +
+                        "-fx-background-color: " + _LightMode.getAppBarColor()
         );
 
         parent.setStyle(
                 "-fx-background-color: " + _LightMode.getAnchorPaneColor() + ";" +
-                "-fx-background-radius: 12;" +
-                "-fx-border-radius: 12;"
+                        "-fx-background-radius: 12;" +
+                        "-fx-border-radius: 12;"
         );
 
         txtTitle.setStyle(
                 "-fx-background-color: " + _LightMode.getFieldColor() + ";" +
-                "-fx-text-fill: " + _LightMode.getSecondaryFontColor() + ";"
+                        "-fx-text-fill: " + _LightMode.getSecondaryFontColor() + ";"
         );
 
         txtDescription.setStyle(
                 "-fx-control-inner-background: " + _LightMode.getFieldColor() + ";" +
-                "-fx-text-fill: " + _LightMode.getSecondaryFontColor() + ";" +
-                "-fx-border-color: " + _LightMode.getAnchorPaneColor()
+                        "-fx-text-fill: " + _LightMode.getSecondaryFontColor() + ";" +
+                        "-fx-border-color: " + _LightMode.getAnchorPaneColor()
         );
 
         btnCancel.setStyle("-fx-background-color: " + _LightMode.getFieldColor());
@@ -128,25 +128,25 @@ public class Add_Check_Update_Delete_TaskController extends Controller{
     private void setDarkTheme(){
         vboxFormAppBar.setStyle(
                 "-fx-background-radius: 12 12 0 0;" +
-                "-fx-border-radius: 12 12 0 0;" +
-                "-fx-background-color: " + _DarkMode.getAppBarColor()
+                        "-fx-border-radius: 12 12 0 0;" +
+                        "-fx-background-color: " + _DarkMode.getAppBarColor()
         );
 
         parent.setStyle(
                 "-fx-background-color: " + _DarkMode.getAnchorPaneColor() + ";" +
-                "-fx-background-radius: 12;" +
-                "-fx-border-radius: 12;"
+                        "-fx-background-radius: 12;" +
+                        "-fx-border-radius: 12;"
         );
 
         txtTitle.setStyle(
                 "-fx-background-color: " + _DarkMode.getFieldColor() + ";" +
-                "-fx-text-fill: " + _DarkMode.getSecondaryFontColor()
+                        "-fx-text-fill: " + _DarkMode.getSecondaryFontColor()
         );
 
         txtDescription.setStyle(
                 "-fx-control-inner-background: " + _DarkMode.getFieldColor() + ";" +
-                "-fx-text-fill: " + _DarkMode.getSecondaryFontColor() + ";" +
-                "-fx-background-color: " + _DarkMode.getAnchorPaneColor() +";"
+                        "-fx-text-fill: " + _DarkMode.getSecondaryFontColor() + ";" +
+                        "-fx-background-color: " + _DarkMode.getAnchorPaneColor() +";"
         );
 
         btnCancel.setStyle("-fx-background-color: " + _DarkMode.getFieldColor());
@@ -199,7 +199,8 @@ public class Add_Check_Update_Delete_TaskController extends Controller{
             setTaskList("C:\\Users\\ammar\\IdeaProjects\\ProjectOOP\\target\\classes\\com\\example\\oop_todo\\text_file\\tasks.txt");
         } catch(Exception e){
             System.out.println("ERROR HERE");
-            System.out.println("SHARVIN");
+
+            System.out.println("syukri");
         }
 
         System.out.println("at least it works");
@@ -232,4 +233,3 @@ public class Add_Check_Update_Delete_TaskController extends Controller{
 
 
 }
-
