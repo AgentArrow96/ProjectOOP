@@ -36,7 +36,7 @@ public class TaskList implements Persistable{
             String line;
             while ((line = br.readLine()) != null) {
                 // Skip empty lines or lines that do not have the expected format
-                if (!line.trim().isEmpty() && line.split(",").length == 5) { // Assuming 5 fields: id, title, description, dueDate, isPriority
+                if (!line.trim().isEmpty() && line.split(",").length == 6) {
                     try {
                         tasks.add(Task.fromString(line));
                     } catch (Exception e) {
@@ -64,11 +64,46 @@ public class TaskList implements Persistable{
     }
 
     public void addTask(String title, String description, LocalDate dueDate, boolean isPriority) {
+        // Load tasks from file to ensure we have the latest list and to compute the next unique ID accurately
+        load();
         long uniqueId = generateUniqueID(); // Generate a unique ID
         Task newTask = new Task(uniqueId, title, description, dueDate, isPriority);
-        tasks.add(newTask);
-        save();
+
+        try (BufferedWriter bw = new BufferedWriter(new FileWriter(filename, true))) {
+            bw.write(newTask.toString());
+            bw.newLine();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
     }
+
+    //NOT USED YET
+    public void updateTask(long id, String title, String description, LocalDate dueDate, boolean isPriority) {
+        // Find the task by ID
+        for (Task task : tasks) {
+            if (task.getId() == id) {
+                // Update task properties
+                task.setTitle(title);
+                task.setDescription(description);
+                task.setDueDate(dueDate);
+                task.setPriority(isPriority);
+                break; // Exit the loop once the task is found and updated
+            }
+        }
+        save(); // Save the updated tasks list to the file
+    }
+
+
+    //NOT USED YET
+    public Task getTaskById(long id) {
+        for (Task task : tasks) {
+            if (task.getId() == id) {
+                return task;
+            }
+        }
+        return null; // Return null or throw an exception if the task is not found
+    }
+
 
     public void removeTask(Task task) {
         tasks.remove(task);
