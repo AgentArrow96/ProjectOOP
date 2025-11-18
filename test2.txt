@@ -1,0 +1,1855 @@
+"""
+NO OLLAMA
+"""
+
+from __future__ import annotations
+import os, json, re, time, base64, io
+from collections import defaultdict
+from datetime import datetime, date, timedelta
+from typing import Dict, Any, List, Tuple, Optional
+
+from dotenv import load_dotenv
+import pandas as pd
+import numpy as np
+from matplotlib.figure import Figure
+
+try:
+    from json_repair import repair_json as _repair_json_lib
+except Exception:
+    _repair_json_lib = None
+
+try:
+    from openai import OpenAI as _OpenAI
+except Exception:
+    _OpenAI = None
+
+load_dotenv()
+
+# -------------------- COMMON / EXISTING ENV --------------------
+SEED           = int(os.getenv("SEED", "42"))
+TEMPERATURE    = float(os.getenv("TEMPERATURE", "0.2"))
+TOP_P          = float(os.getenv("TOP_P", "0.9"))
+RUN_MODE       = os.getenv("RUN_MODE", "test").strip().lower()  # "test" | "prod"
+XAI_OUTPUT_XLS = os.getenv("XAI_OUTPUT_PATH", "./xai_outputs.xlsx")
+XAI_DATA_PATH  = os.getenv("XAI_DATA_PATH", "./Book1.xlsx")
+XAI_MAX_DRIVERS= int(os.getenv("XAI_MAX_DRIVERS", "4"))  # rule-based fallback top-N
+XAI_CONTEXT_JSON = os.getenv("XAI_CONTEXT_JSON", "").strip()
+
+XAI_OVERALL_MODE = os.getenv("XAI_OVERALL_MODE", "hybrid").strip().lower()  # 'hybrid' | 'llm' | 'rb'
+
+DATABRICKS_BASE_URL = (os.getenv("DATABRICKS_BASE_URL", "") or "").strip().rstrip("/")
+DATABRICKS_TOKEN = os.getenv("DATABRICKS_TOKEN", "").strip()
+DATABRICKS_MODEL = os.getenv("DATABRICKS_MODEL", "").strip()
+
+XAI_SHAP_AGG_MODE = os.getenv("XAI_SHAP_AGG_MODE", "monthly").strip().lower()  # 'monthly' | 'weekly'
+
+# NEW: toggle whether to include Model_Outputs context in XAI
+XAI_INCLUDE_MODEL_OUTPUTS = os.getenv("XAI_INCLUDE_MODEL_OUTPUTS", "1").strip() == "1"
+
+# NEW: explicit model lists for reasoning vs standard models
+REASONING_MODEL_NAMES = {
+    "o1", "o1-mini", "o1-preview",
+    "o3", "o3-mini",
+    "o4", "o4-mini",
+}
+
+STANDARD_MODEL_NAMES = {
+    "gpt-4.1-mini", "gpt-4.1",
+    "gpt-4o", "gpt-4o-mini",
+    "gpt-3.5-turbo",
+}
+
+def _is_reasoning_model_name(name: str) -> bool:
+    """
+    Decide if a model should be treated as a reasoning model using explicit lists
+    of reasoning and standard model names.
+    """
+    if not name:
+        return False
+    normalized = name.strip().lower()
+    # strip provider / endpoint prefix, keep bare model token
+    token = normalized.split("/")[-1]
+    # strip tag (e.g. ':latest') if present
+    token = token.split(":")[0]
+
+    if token in REASONING_MODEL_NAMES:
+        return True
+    if token in STANDARD_MODEL_NAMES:
+        return False
+    # Unknown models default to standard behaviour
+    return False
+
+# Global flag for the active backend/model
+IS_REASONING_MODEL = _is_reasoning_model_name(DATABRICKS_MODEL)
+
+# Metrics / token estimation
+XAI_SAVE_METRICS = os.getenv("XAI_SAVE_METRICS", "1").strip() == "1"
+XAI_METRICS_CSV = os.getenv("XAI_METRICS_CSV", "./xai_llm_metrics.csv")
+
+# NEW: limits for tabular + plot context
+XAI_MAX_TRAIN_ROWS = int(os.getenv("XAI_MAX_TRAIN_ROWS", "10"))
+XAI_MAX_TRAIN_FEATURES = int(os.getenv("XAI_MAX_TRAIN_FEATURES", "8"))
+XAI_MAX_SCATTER_FEATURES = int(os.getenv("XAI_MAX_SCATTER_FEATURES", "4"))
+
+# Optional tokenizer (best-effort). If unavailable, fall back to char/4 heuristic.
+try:
+    import tiktoken as _tiktoken
+    _tk_enc = _tiktoken.get_encoding("cl100k_base")
+except Exception:
+    _tk_enc = None
+
+def _estimate_tokens(text: str) -> int:
+    if not text:
+        return 0
+    try:
+        if _tk_enc is not None:
+            return len(_tk_enc.encode(text))
+    except Exception:
+        pass
+    return max(1, int(len(text) / 4))
+
+# Global metrics log
+LLM_METRICS_LOG: List[Dict[str, Any]] = []
+LAST_CALL_METRICS: Dict[str, Any] = {}
+
+
+def aggregate_weekly_flat_to_monthly_mean(
+    weekly_flat: Dict[str, Any],
+    out_months: int = 4
+):
+    """
+    Vectorized monthly aggregation using pandas:
+
+    weekly_flat: {
+      "0": {"Group": "A", "Date": "YYYY-MM-DD", "grp_contri"/"Grp_contri": ...},
+      "1": {...}, ...
+    }
+
+    Returns:
+      monthly_flat: {
+        "0": {"Group": ..., "Date": "YYYY-MM-01", "Avg_grp_contri": ...},
+        ...
+      },
+      groups_sorted: [group1, group2, ...],
+      months_horizon: ["YYYY-MM", ...]  # length = out_months
+    """
+    if not isinstance(weekly_flat, dict) or not weekly_flat:
+        raise ValueError("Weekly JSON is empty or not a dict")
+
+    df = pd.DataFrame.from_dict(weekly_flat, orient="index")
+
+    if "Group" not in df.columns or "Date" not in df.columns:
+        raise ValueError("Weekly JSON must have 'Group' and 'Date' fields")
+
+    # Find contribution column
+    contrib_col = None
+    for cand in ("grp_contri", "Grp_contri", "grp_contribution", "Grp_contribution"):
+        if cand in df.columns:
+            contrib_col = cand
+            break
+    if contrib_col is None:
+        raise ValueError("Weekly JSON missing contribution column (e.g. 'grp_contri')")
+
+    df = df[["Group", "Date", contrib_col]].copy()
+    df["Date"] = pd.to_datetime(df["Date"])
+    df["Grp_contri"] = pd.to_numeric(df[contrib_col], errors="coerce")
+    df = df.dropna(subset=["Grp_contri"])
+
+    if df.empty:
+        raise ValueError("Weekly JSON has no valid numeric contributions")
+
+    # Monthly period
+    df["Period"] = df["Date"].dt.to_period("M")
+    start_period = df["Period"].min()
+    if pd.isna(start_period):
+        raise ValueError("Unable to determine start month from 'Date'")
+
+    # Build horizon of consecutive months
+    periods = [start_period + i for i in range(out_months)]
+    groups_sorted = sorted(df["Group"].astype(str).unique().tolist())
+
+    # Full grid: all groups x all months, fill missing with 0
+    idx = pd.MultiIndex.from_product(
+        [groups_sorted, periods],
+        names=["Group", "Period"]
+    )
+
+    monthly = (
+        df.groupby(["Group", "Period"])["Grp_contri"]
+          .mean()
+          .reindex(idx, fill_value=0.0)
+          .reset_index()
+    )
+
+    monthly_flat: Dict[str, Any] = {}
+    for i, row in monthly.iterrows():
+        period: pd.Period = row["Period"]
+        monthly_flat[str(i)] = {
+            "Group": row["Group"],
+            "Date": period.to_timestamp(how="start").strftime("%Y-%m-%d"),
+            "Avg_grp_contri": round(float(row["Grp_contri"]), 6),
+        }
+
+    months_horizon = [str(p) for p in periods]
+    return monthly_flat, groups_sorted, months_horizon
+
+def build_label_policy_from_monthly(monthly_flat: Dict[str, Any]):
+    """
+    Use numpy.percentile instead of manual percentile logic.
+    """
+    mags = np.array(
+        [abs(float(rec["Avg_grp_contri"])) for rec in monthly_flat.values()],
+        dtype=float,
+    )
+
+    if mags.size == 0:
+        p50, p80 = 0.0, 0.0
+    else:
+        p50, p80 = np.percentile(mags, [50, 80])
+
+    return {
+        "slightly":      {"lt": float(p50)},
+        "moderately":    {"ge": float(p50), "lt": float(p80)},
+        "significantly": {"ge": float(p80)},
+    }
+
+
+# ------------- FACTS PREPARATION FOR LLM ------------------
+def month_label(ym: str) -> str:
+    return datetime.strptime(ym+"-01", "%Y-%m-%d").strftime("%b %Y")
+
+def build_group_trends(payload_months: List[Dict[str, Any]]) -> Dict[str, Any]:
+    by_group = defaultdict(list)
+    for m in payload_months:
+        for g in m["groups"]:
+            by_group[g["name"]].append(g["value"])
+    out = {}
+    for g, vals in by_group.items():
+        sign_changes = sum(1 for i in range(1, len(vals)) if (vals[i] > 0) != (vals[i-1] > 0))
+        out[g] = {
+            "mean": round(sum(vals)/len(vals), 3),
+            "share_positive": round(sum(1 for v in vals if v > 0)/len(vals), 2),
+            "sign_changes": sign_changes
+        }
+    return out
+
+def build_month_balance(payload_months: List[Dict[str, Any]]) -> Dict[str, Any]:
+    out = {}
+    for m in payload_months:
+        ym = m["month"]
+        vals = [abs(g["value"]) for g in m["groups"]]
+        sum_abs = sum(vals)
+        net = abs(m["net_effect"])
+        ratio = net / sum_abs if sum_abs else 0.0
+        if ratio < 0.30: label = "mostly offsetting"
+        elif ratio < 0.60: label = "mixed"
+        else: label = "concentrated"
+        out[ym] = {"sum_abs": round(sum_abs, 3), "balance_ratio": round(ratio, 3), "balance_label": label}
+    return out
+
+def build_prev_map(months_list: List[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
+    prev_map = {}
+    for i, m in enumerate(months_list):
+        if i == 0:
+            prev_map[m["month"]] = {}
+        else:
+            prev = months_list[i-1]
+            prev_map[m["month"]] = {g["name"]: float(g["value"]) for g in prev["groups"]}
+    return prev_map
+
+def build_weekly_recs_from_grouped(weekly_flat: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """
+    Collapse SHAP_Weekly_Grouped-style JSON into per-date records:
+
+    weekly_flat: {
+      "0": {"Group": "A", "Date": "YYYY-MM-DD", "Grp_contri"/"grp_contri": ...},
+      "1": {...},
+      ...
+    }
+
+    Returns:
+      {
+        "YYYY-MM-DD": {
+          "date": "YYYY-MM-DD",
+          "groups": [ {"name": <Group>, "value": float}, ... ],
+          "net_effect": float
+        },
+        ...
+      }
+    """
+    if not isinstance(weekly_flat, dict):
+        return {}
+
+    by_date: Dict[str, List[Dict[str, float]]] = defaultdict(list)
+    for v in weekly_flat.values():
+        if not isinstance(v, dict):
+            continue
+        dval = v.get("Date")
+        g = v.get("Group")
+        if not dval or not g:
+            continue
+        dstr = str(dval)[:10]
+        contrib = v.get("Grp_contri", v.get("grp_contri"))
+        if contrib is None:
+            continue
+        try:
+            val = float(contrib)
+        except Exception:
+            continue
+        by_date[dstr].append({"name": g, "value": val})
+
+    weekly_recs: Dict[str, Dict[str, Any]] = {}
+    for d, groups in by_date.items():
+        net = sum(g["value"] for g in groups)
+        weekly_recs[d] = {
+            "date": d,
+            "groups": groups,
+            "net_effect": round(net, 4),
+        }
+    return weekly_recs
+
+def build_weekly_prev_map(weekly_recs: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
+    """
+    For each date, map to previous date's group values so _rb_summarize can
+    describe deltas vs prior week.
+    """
+    dates = sorted(weekly_recs.keys())
+    prev_map: Dict[str, Dict[str, float]] = {}
+    for i, d in enumerate(dates):
+        if i == 0:
+            prev_map[d] = {}
+        else:
+            prev_rec = weekly_recs[dates[i - 1]]
+            prev_vals = {g["name"]: float(g["value"]) for g in prev_rec.get("groups", [])}
+            prev_map[d] = prev_vals
+    return prev_map
+
+# ----------------- EXTRA CONTEXT: MODEL & TRAIN DATA -----------------
+def _safe_parse_json_field(val: Any) -> Any:
+    if isinstance(val, (dict, list)):
+        return val
+    if isinstance(val, str):
+        txt = val.strip()
+        if not txt:
+            return {}
+        try:
+            return json.loads(txt)
+        except Exception:
+            if _repair_json_lib is not None:
+                try:
+                    repaired = _repair_json_lib(txt)
+                    return json.loads(repaired)
+                except Exception:
+                    pass
+    return val
+
+def _plot_y_train_base64(y_df: pd.DataFrame, date_col: str, target_col: str) -> str:
+    if y_df is None or y_df.empty:
+        return ""
+
+    df = y_df.copy()
+    try:
+        df[date_col] = pd.to_datetime(df[date_col])
+        df = df.sort_values(date_col)
+        x = df[date_col]
+        xlabel = date_col
+    except Exception:
+        x = list(range(len(df)))
+        xlabel = "index"
+
+    fig = Figure(figsize=(6, 3))
+    ax = fig.subplots()
+    ax.plot(x, df[target_col])
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(target_col)
+    ax.set_title("y_train time series")
+    fig.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight")
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+def _plot_x_train_scatter_base64(x_df: pd.DataFrame, date_col: str, feature_cols: List[str]) -> str:
+    if x_df is None or x_df.empty:
+        return ""
+
+    df = x_df.copy()
+    try:
+        df[date_col] = pd.to_datetime(df[date_col])
+        df = df.sort_values(date_col)
+        x = df[date_col]
+        xlabel = date_col
+    except Exception:
+        x = list(range(len(df)))
+        xlabel = "index"
+
+    sel_features = [c for c in feature_cols[:XAI_MAX_SCATTER_FEATURES] if c in df.columns]
+    if not sel_features:
+        return ""
+
+    fig = Figure(figsize=(6, 3))
+    ax = fig.subplots()
+    for feat in sel_features:
+        ax.scatter(x, df[feat], s=10, label=feat)
+
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("feature value")
+    ax.set_title("X_train feature scatter")
+    if len(sel_features) > 1:
+        ax.legend(loc="best", fontsize="xx-small")
+    fig.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight")
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+"""def _trained_data_to_df(trained: Any) -> Optional[pd.DataFrame]:
+
+
+    
+    #Best-effort parser for Trained_Data into a tidy DataFrame with
+    #columns ['Date', 'Actuals_Train', 'Fitted_Train'].
+
+    Handles:
+    - dict-of-dicts: {date: {Actuals_Train:..., Fitted_Train:...}, ...}
+    - list-of-dicts: [{Date:..., Actuals_Train:..., Fitted_Train:...}, ...]
+    - columnar dict: {col_name: [..], ...}
+    
+    if trained is None:
+        return None
+
+    # Columnar dict: {col_name: [..], ...}
+    if isinstance(trained, dict) and trained and all(isinstance(v, list) for v in trained.values()):
+        df = pd.DataFrame(trained)
+        rename: Dict[str, str] = {}
+        for c in df.columns:
+            lc = c.strip().lower().replace(" ", "_")
+            if lc in ("date", "datetime", "ds"):
+                rename[c] = "Date"
+            elif "actual" in lc and "fit" not in lc:
+                rename[c] = "Actuals_Train"
+            elif "fitted" in lc or "predict" in lc or "yhat" in lc or "y_fitted" in lc:
+                rename[c] = "Fitted_Train"
+        if rename:
+            df = df.rename(columns=rename)
+        cols = []
+        if "Date" in df.columns:
+            cols.append("Date")
+        if "Actuals_Train" in df.columns:
+            cols.append("Actuals_Train")
+        if "Fitted_Train" in df.columns:
+            cols.append("Fitted_Train")
+        if not cols:
+            return None
+        return df[cols]
+
+    records: List[Dict[str, Any]] = []
+
+    # dict-of-dicts: {date_key: {...}}
+    if isinstance(trained, dict):
+        for k, v in trained.items():
+            if not isinstance(v, dict):
+                continue
+            date_val = v.get("Date", k)
+            actual = None
+            fitted = None
+            for key, val in v.items():
+                lk = key.strip().lower().replace(" ", "_")
+                if "actual" in lk or "y_train" in lk:
+                    actual = val
+                elif "fitted" in lk or "predict" in lk or "yhat" in lk or "y_fitted" in lk:
+                    fitted = val
+            if actual is None and fitted is None:
+                continue
+            records.append({"Date": date_val, "Actuals_Train": actual, "Fitted_Train": fitted})
+
+    # list-of-dicts: [{...}, ...]
+    elif isinstance(trained, list):
+        for item in trained:
+            if not isinstance(item, dict):
+                continue
+            date_val = item.get("Date") or item.get("date")
+            actual = None
+            fitted = None
+            for key, val in item.items():
+                lk = key.strip().lower().replace(" ", "_")
+                if "actual" in lk or "y_train" in lk:
+                    actual = val
+                elif "fitted" in lk or "predict" in lk or "yhat" in lk or "y_fitted" in lk:
+                    fitted = val
+            if actual is None and fitted is None:
+                continue
+            records.append({"Date": date_val, "Actuals_Train": actual, "Fitted_Train": fitted})
+
+    else:
+        return None
+
+    if not records:
+        return None
+
+    df = pd.DataFrame(records)
+    return df
+"""
+
+
+def _trained_data_to_df(trained: Any) -> Optional[pd.DataFrame]:
+    """
+    Best-effort parser for Trained_Data into a tidy DataFrame with
+    columns ['Date', 'Actuals_Train', 'Fitted_Train'] using pandas'
+    polymorphic constructors.
+
+    Supports:
+    - dict-of-dicts: {date: {Actuals_Train:..., Fitted_Train:...}, ...}
+    - columnar dict: {col_name: [..], ...}
+    - list-of-dicts: [{Date:..., Actuals_Train:..., Fitted_Train:...}, ...]
+    """
+    if trained is None:
+        return None
+
+    df: Optional[pd.DataFrame]
+
+    if isinstance(trained, dict):
+        if not trained:
+            return None
+        # Columnar dict
+        if all(isinstance(v, list) for v in trained.values()):
+            df = pd.DataFrame(trained)
+        else:
+            # dict-of-dicts keyed by date
+            df = pd.DataFrame.from_dict(trained, orient="index")
+            df = df.reset_index().rename(columns={"index": "Date"})
+    elif isinstance(trained, list):
+        if not trained:
+            return None
+        df = pd.DataFrame(trained)
+    else:
+        return None
+
+    if df is None or df.empty:
+        return None
+
+    # Normalize column names
+    rename: Dict[str, str] = {}
+    for col in df.columns:
+        lc = str(col).strip().lower().replace(" ", "_")
+        if ("date" in lc or lc in ("ds", "timestamp")) and "Date" not in rename.values():
+            rename[col] = "Date"
+        elif ("actual" in lc or "y_train" in lc) and "Actuals_Train" not in rename.values():
+            rename[col] = "Actuals_Train"
+        elif any(tok in lc for tok in ("fitted", "predict", "prediction", "yhat", "y_fitted")) \
+                and "Fitted_Train" not in rename.values():
+            rename[col] = "Fitted_Train"
+
+    if rename:
+        df = df.rename(columns=rename)
+
+    cols: List[str] = []
+    if "Date" in df.columns:
+        cols.append("Date")
+    if "Actuals_Train" in df.columns:
+        cols.append("Actuals_Train")
+    if "Fitted_Train" in df.columns:
+        cols.append("Fitted_Train")
+
+    if not cols:
+        return None
+
+    return df[cols]
+
+def _plot_trained_data_base64(train_df: pd.DataFrame) -> str:
+    """
+    Line plot of Actuals_Train vs Fitted_Train over Date (or index fallback),
+    encoded as base64 PNG for XAI context.
+    """
+    if train_df is None or train_df.empty:
+        return ""
+
+    df = train_df.copy()
+
+    # X-axis: Date if available and parseable, else index
+    if "Date" in df.columns:
+        try:
+            df["Date"] = pd.to_datetime(df["Date"])
+            df = df.sort_values("Date")
+            x = df["Date"]
+            xlabel = "Date"
+        except Exception:
+            x = list(range(len(df)))
+            xlabel = "index"
+    else:
+        x = list(range(len(df)))
+        xlabel = "index"
+
+    for col in ("Actuals_Train", "Fitted_Train"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    fig = Figure(figsize=(6, 3))
+    ax = fig.subplots()
+    if "Actuals_Train" in df.columns:
+        ax.plot(x, df["Actuals_Train"], label="Actuals train")
+    if "Fitted_Train" in df.columns:
+        ax.plot(x, df["Fitted_Train"], linestyle="--", label="Fitted train")
+
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("value")
+    ax.set_title("Train fit: actual vs fitted")
+    if "Actuals_Train" in df.columns and "Fitted_Train" in df.columns:
+        ax.legend(loc="best", fontsize="xx-small")
+    fig.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight")
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+def _summarize_model_outputs(outputs: Any) -> Tuple[str, Dict[str, Any]]:
+    """
+    Build a small markdown table + basic error stats from model_outputs,
+    where Actuals ≈ y_test and Predictions ≈ y_pred.
+    """
+    records: List[Dict[str, Any]] = []
+
+    if isinstance(outputs, dict):
+        for k, v in outputs.items():
+            if not isinstance(v, dict):
+                continue
+            actual = v.get("Actuals", v.get("Actual", v.get("y_test")))
+            pred = v.get("Predictions", v.get("Prediction", v.get("y_pred")))
+            if actual is None and pred is None:
+                continue
+            records.append({"Date": k, "Actuals": actual, "Predictions": pred})
+    elif isinstance(outputs, list):
+        for item in outputs:
+            if not isinstance(item, dict):
+                continue
+            date_val = item.get("Date") or item.get("date")
+            actual = item.get("Actuals") or item.get("Actual") or item.get("y_test")
+            pred = item.get("Predictions") or item.get("Prediction") or item.get("y_pred")
+            if actual is None and pred is None:
+                continue
+            records.append({"Date": date_val, "Actuals": actual, "Predictions": pred})
+    else:
+        return "", {}
+
+    if not records:
+        return "", {}
+
+    df = pd.DataFrame(records)
+
+    for col in ("Actuals", "Predictions"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    if "Actuals" in df.columns and "Predictions" in df.columns:
+        df["Error"] = df["Predictions"] - df["Actuals"]
+        mae = float(df["Error"].abs().mean())
+        rmse = float((df["Error"]**2).mean() ** 0.5)
+    else:
+        mae = None
+        rmse = None
+
+    table_df = df.iloc[-XAI_MAX_TRAIN_ROWS:, :len(df.columns)]
+    try:
+        table = table_df.to_markdown(index=False, tablefmt="github")
+    except Exception:
+        table = table_df.to_string(index=False)
+
+    summary: Dict[str, Any] = {"n_points": int(len(df))}
+    if mae is not None:
+        summary["mae"] = round(mae, 6)
+        summary["rmse"] = round(rmse, 6)
+    return table, summary
+
+def _normalize_row_date(row: pd.Series) -> Optional[str]:
+    """
+    Try to extract the row's Date column as 'YYYY-MM-DD' string.
+    """
+    date_col = next((c for c in row.index if c.strip().lower() == "date"), None)
+    if not date_col:
+        return None
+    val = row[date_col]
+    if isinstance(val, (datetime, date)):
+        return val.strftime("%Y-%m-%d")
+    if isinstance(val, str):
+        txt = val.strip()
+        if not txt:
+            return None
+        try:
+            dt = pd.to_datetime(txt)
+            return dt.strftime("%Y-%m-%d")
+        except Exception:
+            if re.match(r"^\d{4}-\d{2}-\d{2}", txt):
+                return txt[:10]
+    return None
+
+def _build_extra_context_from_row(
+    row: pd.Series,
+    shap_ungrouped: Optional[Dict[str, Any]] = None,
+    shap_grouped: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """Build extra model + train-data + SHAP context for the LLM from a DF row."""
+    ctx: Dict[str, Any] = {}
+    trained_plot_b64 = ""
+
+    # Model details (JSON string or dict)
+    model_details_col = next((c for c in row.index if c.strip().lower() == "model_details"), None)
+    if model_details_col:
+        ctx["model_details"] = _safe_parse_json_field(row[model_details_col])
+
+    # Train outputs JSON (Trained_Data / model_train_outputs)
+    train_out_col = next(
+        (c for c in row.index if c.strip().lower() in ("trained_data", "model_train_outputs")),
+        None
+    )
+    if train_out_col:
+        parsed_train = _safe_parse_json_field(row[train_out_col])
+        ctx["model_train_outputs"] = parsed_train
+        try:
+            train_df = _trained_data_to_df(parsed_train)
+            if train_df is not None:
+                trained_plot_b64 = _plot_trained_data_base64(train_df)
+        except Exception as e:
+            ctx["model_train_outputs_error"] = f"{type(e).__name__}: {e}"
+
+    # Test outputs JSON (Actuals = y_test, Predictions = y_pred)
+    outputs_col = next((c for c in row.index if c.strip().lower() == "model_outputs"), None)
+    if XAI_INCLUDE_MODEL_OUTPUTS and outputs_col:
+        parsed_outputs = _safe_parse_json_field(row[outputs_col])
+        ctx["model_outputs"] = parsed_outputs
+        try:
+            tbl, summary = _summarize_model_outputs(parsed_outputs)
+            if tbl:
+                ctx["model_outputs_table_markdown"] = tbl
+            if summary:
+                ctx["model_outputs_summary"] = summary
+        except Exception as e:
+            ctx["model_outputs_error"] = f"{type(e).__name__}: {e}"
+    # else: Model_Outputs present but intentionally excluded from XAI context
+
+    # Target label name (optional)
+    target_label_name: Optional[str] = None
+    for c in row.index:
+        if c.strip().lower() == "target_label":
+            try:
+                target_label_name = str(row[c]).strip()
+            except Exception:
+                target_label_name = None
+            break
+
+    # X_train / y_train CSVs
+    x_train_col = next((c for c in row.index if c.strip().lower() == "x_train"), None)
+    y_train_col = next((c for c in row.index if c.strip().lower() == "y_train"), None)
+
+    x_meta: Dict[str, Any] = {}
+    y_meta: Dict[str, Any] = {}
+    x_table = ""
+    y_table = ""
+    x_plot_b64 = ""
+    y_plot_b64 = ""
+
+    # X_train
+    try:
+        if x_train_col and isinstance(row[x_train_col], str) and row[x_train_col].strip():
+            x_path = row[x_train_col]
+            x_df = pd.read_csv(x_path)
+            date_col_x = next((c for c in x_df.columns if c.strip().lower() in ("date","datetime","ds")), x_df.columns[0])
+            feature_cols = [c for c in x_df.columns if c != date_col_x]
+            x_meta = {
+                "path": x_path,
+                "n_rows": int(len(x_df)),
+                "n_features": int(len(feature_cols)),
+                "date_column": date_col_x,
+                "feature_preview": feature_cols[:XAI_MAX_TRAIN_FEATURES],
+            }
+            try:
+                dt = pd.to_datetime(x_df[date_col_x])
+                x_meta["date_min"] = str(dt.min())
+                x_meta["date_max"] = str(dt.max())
+            except Exception:
+                pass
+            cols_for_table = [date_col_x] + feature_cols[:XAI_MAX_TRAIN_FEATURES]
+            table_df = x_df[cols_for_table].iloc[-XAI_MAX_TRAIN_ROWS:]
+            try:
+                x_table = table_df.to_markdown(index=False, tablefmt="github")
+            except Exception:
+                x_table = table_df.to_string(index=False)
+            x_plot_b64 = _plot_x_train_scatter_base64(x_df, date_col_x, feature_cols)
+
+    except Exception as e:
+        x_meta = {"error": f"{type(e).__name__}: {e}"}
+
+    # y_train
+    try:
+        if y_train_col and isinstance(row[y_train_col], str) and row[y_train_col].strip():
+            y_path = row[y_train_col]
+            y_df = pd.read_csv(y_path)
+            date_col_y = next((c for c in y_df.columns if c.strip().lower() in ("date","datetime","ds")), y_df.columns[0])
+            if target_label_name and target_label_name in y_df.columns:
+                target_col = target_label_name
+            else:
+                target_col = y_df.columns[1] if len(y_df.columns) > 1 else y_df.columns[0]
+            y_meta = {
+                "path": y_path,
+                "n_rows": int(len(y_df)),
+                "target_column": target_col,
+                "date_column": date_col_y,
+            }
+            try:
+                dt = pd.to_datetime(y_df[date_col_y])
+                y_meta["date_min"] = str(dt.min())
+                y_meta["date_max"] = str(dt.max())
+            except Exception:
+                pass
+            table_df = y_df[[date_col_y, target_col]].iloc[-XAI_MAX_TRAIN_ROWS:]
+            try:
+                y_table = table_df.to_markdown(index=False, tablefmt="github")
+            except Exception:
+                y_table = table_df.to_string(index=False)
+            y_plot_b64 = _plot_y_train_base64(y_df, date_col_y, target_col)
+
+    except Exception as e:
+        y_meta = {"error": f"{type(e).__name__}: {e}"}
+
+    if x_meta or y_meta or trained_plot_b64:
+        ctx["train_data"] = {
+            "x_train": x_meta,
+            "y_train": y_meta,
+            "x_train_table_markdown": x_table,
+            "y_train_table_markdown": y_table,
+            "x_train_plot_base64": x_plot_b64,
+            "y_train_plot_base64": y_plot_b64,
+            "trained_data_plot_base64": trained_plot_b64,
+        }
+
+    # --- SHAP context filtered by Date ---
+    row_date_str = _normalize_row_date(row)
+
+    shap_ctx: Dict[str, Any] = {}
+
+    # SHAP_Weekly_Ungrouped: { "YYYY-MM-DD": {Feature: value, ...}, ... }
+    if shap_ungrouped and isinstance(shap_ungrouped, dict) and row_date_str:
+        per_date = shap_ungrouped.get(row_date_str)
+        if per_date is not None:
+            shap_ctx["shap_weekly_ungrouped_for_date"] = {
+                "date": row_date_str,
+                "feature_shap": per_date
+            }
+
+    # SHAP_Weekly_Grouped: { "0": {"Group":..., "Date":..., "Grp_contri"/"grp_contri":...}, ... }
+    if shap_grouped and isinstance(shap_grouped, dict) and row_date_str:
+        grouped_list: List[Dict[str, Any]] = []
+        for v in shap_grouped.values():
+            if not isinstance(v, dict):
+                continue
+            dval = v.get("Date")
+            if not dval:
+                continue
+            try:
+                dnorm = _normalize_row_date(pd.Series({"Date": dval}))
+            except Exception:
+                dnorm = str(dval)[:10]
+            if dnorm == row_date_str:
+                contrib = v.get("Grp_contri", v.get("grp_contri"))
+                grouped_list.append({
+                    "Group": v.get("Group"),
+                    "Date": row_date_str,
+                    "Grp_contri": contrib
+                })
+        if grouped_list:
+            shap_ctx["shap_weekly_grouped_for_date"] = {
+                "date": row_date_str,
+                "groups": grouped_list
+            }
+
+    if shap_ctx:
+        ctx["shap_context"] = shap_ctx
+
+    return ctx
+
+def build_llm_payload(
+    monthly_flat: Dict[str, Any],
+    groups: List[str],
+    months: List[str],
+    extra_context: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    by_month = {m: [] for m in months}
+    for rec in monthly_flat.values():
+        ym = rec["Date"][:7]
+        by_month[ym].append({"name": rec["Group"], "value": float(rec["Avg_grp_contri"])})
+
+    net_effects = compute_net_effect_for_month(by_month)
+    label_policy = build_label_policy_from_monthly(monthly_flat)
+
+    months_list = [{"month": m, "groups": by_month[m], "net_effect": net_effects[m]} for m in months]
+    response_contract = [{"month": m, "net_effect": net_effects[m]} for m in months]
+
+    group_trends = build_group_trends(months_list)
+    month_balance = build_month_balance(months_list)
+    prev_map = build_prev_map(months_list)
+
+    return {
+        "months": months_list,
+        "months_count": len(months),
+        "month_order": months,
+        "label_policy": label_policy,
+        "response_contract": response_contract,
+        "context": {
+            "group_trends": group_trends,
+            "month_balance": month_balance,
+            "prev_groups": prev_map,
+            "interpretation_guide": (
+                "SHAP values are additive explanations relative to a baseline; "
+                "they describe contribution signs/magnitudes, not causal effects."
+            ),
+            "model_context": extra_context or {}
+        },
+        "notes": {
+            "net_effect_definition": "Sum across groups for that month (SHAP additivity).",
+            "style": "Be specific and concise; avoid hype; write for business readers.",
+            "llm_is_reasoning_model": bool(IS_REASONING_MODEL)
+        }
+    }
+
+# ------------- JSON  SCHEMA ---------------
+SCHEMA_VERSION = os.getenv("SCHEMA_VERSION", "1").strip()
+if SCHEMA_VERSION == "2":
+    SCHEMA = {
+      "type": "object",
+      "properties": {
+        "months": {
+          "type": "array", "minItems": 4, "maxItems": 4,
+          "items": {
+            "type": "object",
+            "properties": {
+              "month": { "type": "string" },
+              "summary": { "type": "string" },
+              "drivers": {
+                "type":"array",
+                "items":{
+                  "type":"object",
+                  "properties":{
+                    "group":{"type":"string"},
+                    "direction":{"enum":["up","down"]},
+                    "magnitude":{"type":"number"},
+                    "qualifier":{"enum":["slightly","moderately","significantly"]}
+                  },
+                  "required":["group","direction","magnitude","qualifier"],
+                  "additionalProperties": False
+                }
+              },
+              "net_effect": { "type":"number" },
+              "net_explanation": { "type":"string" },
+              "evidence": {
+                "type":"array",
+                "items":{
+                  "type":"object",
+                  "properties":{
+                    "driver":{"type":"string"},
+                    "why":{"type":"string"},
+                    "sources":{
+                      "type":"array",
+                      "items":{
+                        "type":"object",
+                        "properties":{
+                          "title":{"type":"string"},
+                          "outlet":{"type":"string"},
+                          "url":{"type":"string"},
+                          "published":{"type":"string"}
+                        },
+                        "required":["title","url"]
+                      }
+                    }
+                  },
+                  "required":["driver","why","sources"]
+                }
+              },
+              "watch_next": { "type":"string" }
+            },
+            "required": ["month","summary","drivers","net_effect","net_explanation"],
+            "additionalProperties": False
+          }
+        },
+        "overall_summary": { "type":"string" }
+      },
+      "required": ["months","overall_summary"],
+      "additionalProperties": False
+    }
+else:
+    SCHEMA = {
+      "type": "object",
+      "properties": {
+        "months": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "items": {
+            "type": "object",
+            "properties": {
+              "month": { "type": "string" },
+              "summary": { "type": "string" },
+              "drivers": {
+                "type":"array",
+                "items":{
+                  "type":"object",
+                  "properties":{
+                    "group":{"type":"string"},
+                    "direction":{"enum":["up","down"]},
+                    "magnitude":{"type":"number"},
+                    "qualifier":{"enum":["slightly","moderately","significantly"]}
+                  },
+                  "required":["group","direction","magnitude","qualifier"],
+                  "additionalProperties": False
+                }
+              },
+              "net_effect": { "type":"number" },
+              "net_explanation": { "type":"string" },
+              "contextual_reasons": {
+                "type":"array",
+                "items":{
+                  "type":"object",
+                  "properties":{
+                    "driver":{"type":"string"},
+                    "reason":{"type":"string"},
+                    "source_type":{"enum":["news","hypothesis","internal"]},
+                    "source_url":{"type":"string"},
+                    "confidence":{"enum":["low","medium","high"]},
+                    "disclaimer":{"type":"string"}
+                  },
+                  "required":["driver","reason","source_type","confidence","disclaimer"],
+                  "additionalProperties": False
+                }
+              }
+            },
+            "required": ["month","summary","drivers","net_effect","net_explanation"],
+            "additionalProperties": False
+          }
+        },
+        "overall_summary": { "type":"string" }
+      },
+      "required": ["months","overall_summary"],
+      "additionalProperties": False
+    }
+
+FORMAT_SCHEMA = {
+  "type": "json_schema",
+  "json_schema": {
+    "name": "xai_monthly_report",
+    "schema": SCHEMA
+  }
+}
+
+# ------------------ SYSTEM PROMPT -----------------
+SYSTEM_PROMPT = (
+    "You are an XAI Narrator for time-series model drivers.\n"
+    "You write succinct, analyst-grade monthly narratives that are dense with specifics, not fluff.\n"
+    "INPUT:\n"
+    " • months[4]: each has {month:'YYYY-MM', groups:[{name,value}], net_effect}.\n"
+    " • label_policy: absolute-magnitude bins → {slightly, moderately, significantly}.\n"
+    " • response_contract: {month, net_effect} ⇒ you MUST echo these net_effect values.\n"
+    " • context: {group_trends, month_balance, prev_groups, model_context}.\n"
+    "STYLE & SCOPE:\n"
+    " • For each month, write 2-4 sentences.\n"
+    " • Mention up to the top-3 positive AND top-3 negative drivers (if present), each with adjective + signed magnitude.\n"
+    " • Compare to prior month when meaningful (sign flips, large deltas).\n"
+    " • Explain the net using the balance_label (offsetting/mixed/concentrated) and |net|/Σ|effects| ratio.\n"
+    " • Treat any model_context fields (model details, train_data markdown tables, base64 plots, model_outputs tables, SHAP context) as background; you may reference them qualitatively but never rewrite or re-encode them.\n"
+    " • Do NOT emit the base64 plot strings in your output; they are only for the calling application.\n"
+    "OUTPUT JSON:\n"
+    " • months: EXACTLY 4, in the SAME order as month_order; copy net_effects from response_contract.\n"
+    " • drivers: include those you mention (≥2 when available; more allowed).\n"
+    " • net_explanation: concise sentence naming why the net landed where it did.\n"
+    " • If schema v2: include 'evidence' (driver-tagged 1-2 bullets) and 'watch_next' (1-2 risks).\n"
+    "JSON RULES: no embedded double quotes; no trailing commas.\n"
+)
+
+# ----------------- LOW-LEVEL JSON PARSING UTILS ------------------------
+def _largest_balanced_json_object(text: str) -> Optional[str]:
+    start = None
+    depth = 0
+    best = None
+    for i, ch in enumerate(text):
+        if ch == '{':
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == '}':
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    cand = text[start:i+1]
+                    if best is None or len(cand) > len(best):
+                        best = cand
+    return best
+
+def _quote_unquoted_keys(s: str) -> str:
+    return re.sub(r'([{\s,])([A-Za-z_][A-Za-z0-9_\-]*)\s*:', r'\1"\2":', s)
+
+def _fix_constants(s: str) -> str:
+    s = re.sub(r'\bNaN\b', 'null', s, flags=re.IGNORECASE)
+    s = re.sub(r'\bInfinity\b', '1e9999', s, flags=re.IGNORECASE)
+    s = re.sub(r'\b-Inf(inity)?\b', '-1e9999', s, flags=re.IGNORECASE)
+    return s
+
+def _normalize_quotes(s: str) -> str:
+    s = s.replace("\u201c", '"').replace("\u201d", '"').replace("\u201e", '"').replace("\u201f", '"')
+    s = s.replace("\u2018", "'").replace("\u2019", "'")
+    return s
+
+def _strip_fences_and_garbage(s: str) -> str:
+    s = s.strip().lstrip("\ufeff")
+    if s.startswith("```"):
+        blocks = [b.strip() for b in s.split("```") if b.strip()]
+        for b in blocks:
+            if b.startswith("{") or b.lower().startswith("json"):
+                s = b
+                break
+    if s.lower().startswith("json"):
+        s = s[4:].strip()
+    if not s.startswith("{") or not s.endswith("}"):
+        maybe = _largest_balanced_json_object(s)
+        if maybe:
+            s = maybe
+    return s
+
+def _attempt_json_repair(text: str) -> dict:
+    if not text:
+        raise ValueError("Empty content; nothing to repair")
+    t = _strip_fences_and_garbage(text)
+    t = _normalize_quotes(t)
+    t = re.sub(r",(\s*[}\]])", r"\1", t)
+    t = _quote_unquoted_keys(t)
+    t = _fix_constants(t)
+    try:
+        return json.loads(t)
+    except Exception:
+        pass
+    if _repair_json_lib is not None:
+        try:
+            repaired = _repair_json_lib(t)
+            return json.loads(repaired)
+        except Exception:
+            pass
+    maybe = _largest_balanced_json_object(t)
+    if maybe:
+        return json.loads(maybe)
+    raise
+
+# ----------------- LLM CALLS (DATABRICKS) ------------------------
+def _get_databricks_client_and_model() -> Tuple[Any, str]:
+    if _OpenAI is None:
+        raise RuntimeError("openai package not available; pip install openai>=1.0.0")
+
+    token = DATABRICKS_TOKEN
+    if not token:
+        try:
+            token = (
+                dbutils.notebook.entry_point.getDbutils()  # type: ignore[name-defined]
+                .notebook()
+                .getContext()
+                .apiToken()
+                .getOrElse(None)
+            )
+        except Exception:
+            token = ""
+
+    if not token:
+        raise RuntimeError("Missing DATABRICKS_TOKEN and could not obtain token from dbutils.")
+
+    base_url = DATABRICKS_BASE_URL
+    if not base_url:
+        raise RuntimeError("DATABRICKS_BASE_URL is not set.")
+    if not base_url.endswith("/serving-endpoints"):
+        base_url = base_url.rstrip("/") + "/serving-endpoints"
+
+    client = _OpenAI(api_key=token, base_url=base_url)
+    model_used = DATABRICKS_MODEL
+    return client, model_used
+
+def call_databricks_llm(payload: Dict[str, Any]) -> tuple[dict, str]:
+    client, model_used = _get_databricks_client_and_model()
+    reasoning = _is_reasoning_model_name(model_used)
+
+    def _mk_messages_for(contract_payload: Dict[str, Any], schema: bool) -> List[Dict[str,str]]:
+        if schema:
+            user_content = json.dumps({"facts": contract_payload, "contract": contract_payload["response_contract"]}, separators=(',',':'))
+        else:
+            user_content = json.dumps(contract_payload, separators=(',',':'))
+        return [
+            {"role": "system", "content": SYSTEM_PROMPT + ("" if schema else "\nReturn ONE JSON object only.")},
+            {"role": "user", "content": user_content}
+        ]
+
+    try_schema = True
+    start = time.time()
+    try:
+        if try_schema:
+            kwargs = {
+                "model": model_used,
+                "messages": _mk_messages_for(payload, schema=True),
+                "response_format": FORMAT_SCHEMA,
+            }
+            if not reasoning:
+                kwargs.update({"temperature": TEMPERATURE, "top_p": TOP_P, "seed": SEED})
+
+            resp = client.chat.completions.create(**kwargs)
+            raw = (resp.choices[0].message.content or "").strip()
+            try:
+                js = json.loads(raw)
+            except Exception:
+                js = _attempt_json_repair(raw)
+            dur = time.time() - start
+            ptok = getattr(resp, "usage", None).prompt_tokens if getattr(resp, "usage", None) else _estimate_tokens(SYSTEM_PROMPT)
+            otok = getattr(resp, "usage", None).completion_tokens if getattr(resp, "usage", None) else _estimate_tokens(raw)
+            LAST_CALL_METRICS.update({
+                "backend": "databricks",
+                "model": model_used,
+                "schema": True,
+                "duration_sec": round(dur,3),
+                "prompt_tokens_est": ptok,
+                "output_tokens_est": otok,
+                "tps_est": round((otok / dur) if dur>0 else 0.0, 2),
+                "is_reasoning_model": reasoning,
+            })
+            LLM_METRICS_LOG.append({**LAST_CALL_METRICS})
+            return js, raw
+    except Exception:
+        pass
+
+    start = time.time()
+    kwargs = {
+        "model": model_used,
+        "messages": _mk_messages_for(payload, schema=False),
+        "response_format": {"type": "json_object"},
+    }
+    if not reasoning:
+        kwargs.update({"temperature": TEMPERATURE, "top_p": TOP_P, "seed": SEED})
+
+    resp = client.chat.completions.create(**kwargs)
+    raw = (resp.choices[0].message.content or "").strip()
+    try:
+        js = json.loads(raw)
+    except Exception:
+        js = _attempt_json_repair(raw)
+    dur = time.time() - start
+    ptok = getattr(resp, "usage", None).prompt_tokens if getattr(resp, "usage", None) else _estimate_tokens(SYSTEM_PROMPT)
+    otok = getattr(resp, "usage", None).completion_tokens if getattr(resp, "usage", None) else _estimate_tokens(raw)
+    LAST_CALL_METRICS.update({
+        "backend": "databricks",
+        "model": model_used,
+        "schema": False,
+        "duration_sec": round(dur,3),
+        "prompt_tokens_est": ptok,
+        "output_tokens_est": otok,
+        "tps_est": round((otok / dur) if dur>0 else 0.0, 2),
+        "is_reasoning_model": reasoning,
+    })
+    LLM_METRICS_LOG.append({**LAST_CALL_METRICS})
+    return js, raw
+
+# ----------------- ROUTER -------------------
+def call_llm(payload: Dict[str, Any]) -> tuple[dict, str]:
+    # Only Databricks backend is supported
+    return call_databricks_llm(payload)
+
+# ----------------- METRICS HELPERS -------------------
+def compute_net_effect_for_month(by_month: Dict[str, List[Dict[str, float]]]) -> Dict[str, float]:
+    out = {}
+    for ym, items in by_month.items():
+        s = sum(float(it["value"]) for it in items)
+        out[ym] = round(s, 2)
+    return out
+
+def _qualifier_for(value: float, policy: Dict[str, Dict[str, float]]) -> str:
+    a = abs(value)
+    lo = policy["slightly"]["lt"]
+    mid_ge = policy["moderately"]["ge"]; mid_lt = policy["moderately"]["lt"]
+    if a < lo: return "slightly"
+    if a >= mid_ge and a < mid_lt: return "moderately"
+    return "significantly"
+
+def _extrema(groups: List[Dict[str, float]]):
+    pos = [g for g in groups if g["value"] > 0]
+    neg = [g for g in groups if g["value"] < 0]
+    top_pos = max(pos, key=lambda x: x["value"]) if pos else None
+    top_neg = min(neg, key=lambda x: x["value"]) if neg else None
+    return top_pos, top_neg
+
+def _rb_summarize(month_rec: Dict[str, Any], policy: Dict[str, Any], prev_values: Optional[Dict[str, float]] = None) -> Tuple[str, List[Dict[str, Any]], str]:
+    groups = month_rec.get("groups", [])
+    net = float(month_rec["net_effect"])
+    prev_values = prev_values or {}
+
+    sorted_groups = sorted(groups, key=lambda g: abs(g["value"]), reverse=True)
+    topk = sorted_groups[:max(2, XAI_MAX_DRIVERS)]
+
+    sum_abs = sum(abs(g["value"]) for g in groups) or 0.0
+    balance_ratio = abs(net) / sum_abs if sum_abs else 0.0
+    if balance_ratio < 0.30: balance_label = "mostly offsetting"
+    elif balance_ratio < 0.60: balance_label = "mixed"
+    else: balance_label = "concentrated"
+
+    drivers, parts = [], []
+
+    def delta_str(name: str, cur_val: float) -> str:
+        if name in prev_values:
+            d = cur_val - prev_values[name]
+            if abs(d) >= 0.05:
+                return f" vs prior month {d:+.2f}"
+        return ""
+
+    for item in topk:
+        name = item["name"]; val = float(item["value"])
+        q = _qualifier_for(val, policy)
+        if val >= 0:
+            drivers.append({"group": name, "direction": "up", "magnitude": round(val, 2), "qualifier": q})
+            parts.append(f'{name} contributed {q} positive impact (+{val:.2f}{delta_str(name, val)})')
+        else:
+            drivers.append({"group": name, "direction": "down", "magnitude": round(abs(val), 2), "qualifier": q})
+            parts.append(f'{name} contributed {q} negative impact (-{abs(val):.2f}{delta_str(name, val)})')
+
+    top_pos, top_neg = _extrema(groups)
+    if top_pos or top_neg:
+        tail = []
+        if top_pos: tail.append(f"strongest up: {top_pos['name']} (+{top_pos['value']:.2f})")
+        if top_neg: tail.append(f"strongest down: {top_neg['name']} ({top_neg['value']:.2f})")
+        if tail:
+            parts.append("; ".join(tail))
+
+    if not parts:
+        summary = "No dominant drivers; movements were small and largely offsetting."
+        drivers = []
+    else:
+        summary = "; ".join(parts)
+        if len(summary) > 240:
+            mid = len(summary)//2
+            cut = summary.rfind("; ", 0, mid)
+            if cut != -1:
+                summary = summary[:cut+1] + " " + summary[cut+2:] + "."
+            else:
+                summary += "."
+        else:
+            summary += "."
+
+    if sum_abs > 0:
+        net_expl = f'Net effect {net:+.2f} = sum of monthly SHAP contributions. Profile: {balance_label} (|net|/Σ|effects| = {balance_ratio:.2f}).'
+    else:
+        net_expl = "Net effect +0.00 = no material contributions this month."
+
+    summary += f' Overall monthly impact: {net:+.2f} ({balance_label}).'
+    return summary, drivers, net_expl
+
+def _compose_overall_summary(payload: Dict[str, Any], months_out: List[Dict[str, Any]]) -> str:
+    months_order: List[str] = payload["month_order"]
+    month_balance: Dict[str, Any] = payload["context"]["month_balance"]
+    facts_by_month = {m["month"]: m for m in payload["months"]}
+    nets = {m: round(float(facts_by_month[m]["net_effect"]), 2) for m in months_order}
+    def _lab(m): return (month_balance[m]["balance_label"], month_balance[m]["balance_ratio"])
+    offsetting = [(m, nets[m], _lab(m)[1]) for m in months_order if _lab(m)[0] == "mostly offsetting"]
+    mixed      = [(m, nets[m], _lab(m)[1]) for m in months_order if _lab(m)[0] == "mixed"]
+    conc_pos   = [(m, nets[m], _lab(m)[1]) for m in months_order if _lab(m)[0] == "concentrated" and nets[m] > 0]
+    conc_neg   = [(m, nets[m], _lab(m)[1]) for m in months_order if _lab(m)[0] == "concentrated" and nets[m] < 0]
+
+    groups = {}
+    for m in months_order:
+        for g in facts_by_month[m]["groups"]:
+            name = g["name"]; val = float(g["value"])
+            groups.setdefault(name, {"vals": [], "months": []})
+            groups[name]["vals"].append(val)
+            groups[name]["months"].append(m)
+
+    group_stats = {}
+    for name, info in groups.items():
+        vals = info["vals"]; ms = info["months"]
+        total = round(sum(vals), 2)
+        sign_flips = sum(1 for i in range(1, len(vals)) if (vals[i] > 0) != (vals[i-1] > 0))
+        max_up = max(vals) if vals else 0.0
+        max_up_idx = vals.index(max_up) if vals else 0
+        max_down = min(vals) if vals else 0.0
+        max_down_idx = vals.index(max_down) if vals else 0
+        rng = round((max_up - max_down), 2)
+        mom = round(vals[-1] - vals[0], 2) if len(vals) >= 2 else 0.0
+        group_stats[name] = {
+            "total": total,
+            "sign_flips": sign_flips,
+            "max_up": round(max_up, 2),
+            "max_up_m": ms[max_up_idx],
+            "max_down": round(max_down, 2),
+            "max_down_m": ms[max_down_idx],
+            "range": abs(rng),
+            "momentum": mom,
+            "last": round(vals[-1], 2),
+            "first": round(vals[0], 2),
+        }
+
+    sorted_total = sorted(group_stats.items(), key=lambda kv: kv[1]["total"], reverse=True)
+    top_tail = next((kv for kv in sorted_total if kv[1]["total"] > 0), None)
+    top_head = next((kv for kv in sorted(group_stats.items(), key=lambda kv: kv[1]["total"]) if kv[1]["total"] < 0), None)
+    most_vol = max(group_stats.items(), key=lambda kv: (kv[1]["sign_flips"], kv[1]["range"])) if group_stats else None
+
+    last_m = months_order[-1]
+    last_vals = []
+    for name, st in group_stats.items():
+        try:
+            idx = groups[name]["months"].index(last_m)
+            last_vals.append((name, round(groups[name]["vals"][idx], 2)))
+        except Exception:
+            pass
+    last_ups  = sorted([(n,v) for (n,v) in last_vals if v > 0], key=lambda x: x[1], reverse=True)[:2]
+    last_down = sorted([(n,abs(v)) for (n,v) in last_vals if v < 0], key=lambda x: x[1], reverse=True)[:2]
+
+    def ml(m): return datetime.strptime(m + "-01", "%Y-%m-%d").strftime("%b %Y")
+    def mfmt(triplets):
+        return ", ".join(f"{ml(m)} ({nets[m]:+,.2f}; r={month_balance[m]['balance_ratio']:.2f})" for m,_,_ in triplets)
+
+    lines = []
+    window = f"{ml(months_order[0])}–{ml(months_order[-1])}"
+    head_bits = []
+    if offsetting: head_bits.append(f"offsetting in {mfmt(offsetting)}")
+    if mixed:      head_bits.append(f"mixed in {mfmt(mixed)}")
+    if conc_pos:   head_bits.append(f"concentrated up in {mfmt(conc_pos)}")
+    if conc_neg:   head_bits.append(f"concentrated down in {mfmt(conc_neg)}")
+    if head_bits:
+        lines.append(f"Net picture ({window}): " + "; ".join(head_bits) + ".")
+    else:
+        lines.append(f"Net picture ({window}): monthly nets were modest without clear concentration.")
+
+    story = []
+    if top_tail:
+        n, st = top_tail
+        story.append(f"Top tailwind: {n} (total {st['total']:+.2f}; peak {st['max_up']:+.2f} in {ml(st['max_up_m'])}).")
+    if top_head:
+        n, st = top_head
+        story.append(f"Largest headwind: {n} (total {st['total']:+.2f}; trough {st['max_down']:+.2f} in {ml(st['max_down_m'])}).")
+    if most_vol:
+        n, st = most_vol
+        story.append(f"Most volatile: {n} (sign flips {st['sign_flips']}, range ±{st['range']:.2f}).")
+    if last_ups:
+        story.append("Momentum into last month: " + ", ".join(f"{n} (+{v:.2f})" for n,v in last_ups) + ".")
+    if last_down:
+        story.append("Last-month headwinds: " + ", ".join(f"{n} (-{v:.2f})" for n,v in last_down) + ".")
+    if story:
+        lines.append("Driver storyline: " + " ".join(story))
+
+    ratios = ", ".join(f"{ml(m)} {month_balance[m]['balance_ratio']:.2f}" for m in months_order)
+    lines.append(f"Mix & concentration (|net|/Σ|effects|): {ratios}.")
+
+    watch_bits = []
+    if most_vol:
+        n, _ = most_vol
+        watch_bits.append(f"{n} directionality (another sign flip could dominate the net)")
+    if top_head:
+        n, _ = top_head
+        watch_bits.append(f"persistence of {n} headwinds")
+    if not watch_bits:
+        watch_bits.append("shifts in drivers with largest absolute monthly magnitudes")
+    lines.append("What to watch next: " + "; ".join(watch_bits) + ".")
+
+    lines.append("Note: SHAP is additive relative to a baseline; it explains contributions, not causality.")
+    return "\n".join(lines)
+
+def normalize_llm_out(llm_out: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
+    policy = payload["label_policy"]
+    want_order = payload["month_order"]
+    by_month = {m["month"]: m for m in payload["months"]}
+    prev_map = payload.get("context", {}).get("prev_groups", {})
+    reasoning = bool(payload.get("notes", {}).get("llm_is_reasoning_model", IS_REASONING_MODEL))
+
+    months_out = []
+    got = {m["month"]: m for m in llm_out.get("months", []) if isinstance(m, dict)}
+
+    for ym in want_order:
+        base = {"month": ym, "net_effect": by_month[ym]["net_effect"]}
+        existing = got.get(ym, {})
+        summary = existing.get("summary")
+        drivers = existing.get("drivers")
+        net_effect = existing.get("net_effect", base["net_effect"])
+        net_expl = existing.get("net_explanation")
+
+        contextual_reasons = existing.get("contextual_reasons", None)
+        evidence = existing.get("evidence", None)
+        wn = existing.get("watch_next")
+
+        if reasoning:
+            needs_rb = False
+            if not isinstance(summary, str) or not summary.strip():
+                needs_rb = True
+            if not isinstance(drivers, list):
+                needs_rb = True
+            if not isinstance(net_expl, str) or not net_expl.strip():
+                needs_rb = True
+            if needs_rb:
+                facts = {"month": ym, "groups": by_month[ym]["groups"], "net_effect": net_effect}
+                rb_summary, rb_drivers, rb_net_expl = _rb_summarize(facts, policy, prev_map.get(ym, {}))
+                if not isinstance(summary, str) or not summary.strip():
+                    summary = rb_summary
+                if not isinstance(drivers, list):
+                    drivers = rb_drivers
+                if not isinstance(net_expl, str) or not net_expl.strip():
+                    net_expl = rb_net_expl
+        else:
+            if not (summary and isinstance(drivers, list) and net_expl):
+                facts = {"month": ym, "groups": by_month[ym]["groups"], "net_effect": net_effect}
+                summary, drivers, net_expl = _rb_summarize(facts, policy, prev_map.get(ym, {}))
+
+        month_obj: Dict[str, Any] = {
+            "month": ym,
+            "summary": summary,
+            "drivers": drivers,
+            "net_effect": net_effect,
+            "net_explanation": net_expl
+        }
+
+        if SCHEMA_VERSION == "2":
+            month_obj["evidence"] = evidence if isinstance(evidence, list) else []
+            if wn:
+                month_obj["watch_next"] = wn
+        else:
+            month_obj["contextual_reasons"] = contextual_reasons if isinstance(contextual_reasons, list) else []
+
+        months_out.append(month_obj)
+
+    llm_overall = llm_out.get("overall_summary") if isinstance(llm_out, dict) else None
+    auto_overall = _compose_overall_summary(payload, months_out)
+    if XAI_OVERALL_MODE == "llm" and isinstance(llm_overall, str) and llm_overall.strip():
+        overall = llm_overall
+    elif XAI_OVERALL_MODE == "rb":
+        overall = auto_overall
+    else:
+        if isinstance(llm_overall, str) and len(llm_overall.strip()) >= 200:
+            overall = llm_overall
+        else:
+            overall = auto_overall
+
+    return {"months": months_out, "overall_summary": overall}
+
+# ---------------- DATA PREPROCESSING ------------------
+def _safe_load_weekly_json(x: Any) -> Dict[str, Any]:
+    if isinstance(x, dict):
+        return x
+    if isinstance(x, str):
+        try:
+            return json.loads(x)
+        except Exception:
+            if _repair_json_lib is not None:
+                try:
+                    repaired = _repair_json_lib(x)
+                    return json.loads(repaired)
+                except Exception:
+                    pass
+            maybe = _largest_balanced_json_object(x)
+            if maybe:
+                return json.loads(maybe)
+    raise ValueError("Unable to parse Weekly/SHAP_Weekly_Grouped JSON")
+
+def _make_monthly_text(llm_out: Dict[str, Any], payload: Dict[str, Any]) -> str:
+    lines = []
+    for m in payload["months"]:
+        ym = m["month"]
+        mo = next((x for x in llm_out["months"] if x["month"] == ym), None)
+        if mo:
+            label = datetime.strptime(ym+"-01", "%Y-%m-%d").strftime("%b %Y")
+            balance = payload["context"]["month_balance"][ym]["balance_label"]
+            lines.append(f"- {label}: {mo['summary']} Net (sum of SHAP): {mo['net_effect']:+.2f} [{balance}]")
+            evid = mo.get("evidence", [])
+            if evid:
+                for ev in evid[:2]:
+                    srcs = ev.get("sources", [])[:2]
+                    if srcs:
+                        src_bits = "; ".join(f"{s.get('outlet','')}: {s.get('title','')}" for s in srcs if s.get("title"))
+                        lines.append(f"  • Evidence ({ev.get('driver','')}): {ev.get('why','')}. {src_bits}")
+                    else:
+                        lines.append(f"  • Evidence ({ev.get('driver','')}): {ev.get('why','')}.")
+            else:
+                cr = mo.get("contextual_reasons", [])
+                if cr:
+                    for r in cr[:2]:
+                        if r.get("source_url"):
+                            lines.append(f"  • Context ({r.get('driver','')}): {r.get('reason','')} [{r.get('source_url')}]")
+                        else:
+                            lines.append(f"  • Context ({r.get('driver','')}): {r.get('reason','')}")
+    lines.append("\n=== OVERALL SUMMARY ===")
+    lines.append(llm_out.get("overall_summary", ""))
+    return "\n".join(lines)
+
+def run_xai_once(
+    weekly_flat: Dict[str, Any],
+    extra_context: Optional[Dict[str, Any]] = None
+) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], str]:
+    """
+    Wrapper to either:
+    - Use SHAP_Weekly_Grouped as-is (XAI_SHAP_AGG_MODE='weekly') and skip monthly aggregation + LLM; or
+    - Aggregate to monthly and run the full LLM XAI pipeline (XAI_SHAP_AGG_MODE='monthly').
+    """
+    # Weekly-level mode: SHAP_Weekly_Grouped is used as-is, no aggregation or LLM call.
+    if XAI_SHAP_AGG_MODE == "weekly":
+        LAST_CALL_METRICS.clear()
+        LLM_METRICS_LOG.clear()
+        monthly_flat = weekly_flat  # keep original structure; not used as Monthly_JSON_Drivers in prod
+        payload = {
+            "months": [],
+            "months_count": 0,
+            "month_order": [],
+            "label_policy": {},
+            "response_contract": [],
+            "context": {
+                "group_trends": {},
+                "month_balance": {},
+                "prev_groups": {},
+                "model_context": extra_context or {}
+            },
+            "notes": {
+                "net_effect_definition": "Aggregation disabled: SHAP_Weekly_Grouped used as-is.",
+                "style": "Aggregation-only mode.",
+                "llm_is_reasoning_model": bool(IS_REASONING_MODEL)
+            }
+        }
+        llm_out: Dict[str, Any] = {}
+        xai_text = "[XAI] Aggregation/LLM disabled (XAI_SHAP_AGG_MODE='weekly'); SHAP_Weekly_Grouped used as-is."
+        return monthly_flat, payload, llm_out, xai_text
+
+    # Monthly-level mode (default): original behaviour
+    monthly_flat, groups, months = aggregate_weekly_flat_to_monthly_mean(weekly_flat, out_months=4)
+    payload = build_llm_payload(monthly_flat, groups, months, extra_context=extra_context)
+    try:
+        llm_raw_out, _raw = call_llm(payload)
+        llm_out = normalize_llm_out(llm_raw_out, payload)
+    except Exception:
+        llm_out = normalize_llm_out({}, payload)
+    xai_text = _make_monthly_text(llm_out, payload)
+    return monthly_flat, payload, llm_out, xai_text
+
+def run_pipeline_from_df(df_in: pd.DataFrame, mode: str = "test") -> Optional[pd.DataFrame]:
+    # Weekly/grouped SHAP column (still expect 'SHAP_Weekly_Grouped')
+    weekly_col = next(
+        (c for c in df_in.columns if c.strip().lower() == "shap_weekly_grouped"),
+        None
+    )
+    if weekly_col is None:
+        raise ValueError("Input DataFrame must contain 'SHAP_Weekly_Grouped'")
+
+    # NEW: main indexing columns for this version
+    date_col = next((c for c in df_in.columns if c.strip().lower() == "date"), None)
+    fw_col = next((c for c in df_in.columns if c.strip().lower() == "forecast_week"), None)
+    if date_col is None or fw_col is None:
+        raise ValueError("Input DataFrame must contain 'Date' and 'Forecast_Week' columns.")
+
+    # Global SHAP JSONs (only last row has entries, per your note)
+    shap_ungrouped_col = next((c for c in df_in.columns if c.strip().lower() == "shap_weekly_ungrouped"), None)
+    shap_grouped_col   = next((c for c in df_in.columns if c.strip().lower() == "shap_weekly_grouped"), None)
+
+    shap_ungrouped_global: Optional[Dict[str, Any]] = None
+    shap_grouped_global: Optional[Dict[str, Any]] = None
+
+    if shap_ungrouped_col:
+        series = df_in[shap_ungrouped_col].dropna()
+        if not series.empty:
+            shap_ungrouped_global = _safe_parse_json_field(series.iloc[-1])
+
+    if shap_grouped_col:
+        series = df_in[shap_grouped_col].dropna()
+        if not series.empty:
+            shap_grouped_global = _safe_parse_json_field(series.iloc[-1])
+
+    weekly_series = df_in[weekly_col].dropna()
+    if weekly_series.empty:
+        raise ValueError(f"Column '{weekly_col}' does not contain any non-null grouped SHAP.")
+
+    # This is the global SHAP_Weekly_Grouped JSON we aggregate to monthly
+    weekly_flat_global = _safe_load_weekly_json(weekly_series.iloc[-1])
+
+    # ---------- 1) Build per-row context (X_train, y_train, Model_Outputs, SHAP per date, etc.) ----------
+    per_row_ctx_by_date: Dict[str, Dict[str, Any]] = {}
+
+    for _, row in df_in.iterrows():
+        row_date_str = _normalize_row_date(row)
+        if not row_date_str:
+            continue
+        extra_ctx = _build_extra_context_from_row(row, shap_ungrouped_global, shap_grouped_global)
+        fw_val = row[fw_col] if fw_col in row.index else None
+        per_row_ctx_by_date[row_date_str] = {
+            "forecast_week": fw_val,
+            "model_context": extra_ctx,
+        }
+
+    # ---------- 2) Weekly rule-based summaries from grouped SHAP ----------
+    weekly_recs = build_weekly_recs_from_grouped(weekly_flat_global)
+    weekly_prev_map = build_weekly_prev_map(weekly_recs)
+
+    # Use monthly aggregation only to build magnitude label policy (slightly/moderately/significantly)
+    try:
+        monthly_flat_for_policy, _groups_policy, _months_policy = aggregate_weekly_flat_to_monthly_mean(
+            weekly_flat_global,
+            out_months=4
+        )
+        label_policy = build_label_policy_from_monthly(monthly_flat_for_policy)
+    except Exception:
+        # Fallback thresholds if aggregation fails for any reason
+        label_policy = {
+            "slightly":      {"lt": 1.0},
+            "moderately":    {"ge": 1.0, "lt": 2.0},
+            "significantly": {"ge": 2.0}
+        }
+
+    weekly_rb_by_date: Dict[str, Dict[str, Any]] = {}
+    for d, rec in weekly_recs.items():
+        try:
+            facts = {
+                "month": d,  # reused field name; semantically it's "week" here
+                "groups": rec["groups"],
+                "net_effect": rec["net_effect"],
+            }
+            prev_vals = weekly_prev_map.get(d, {})
+            w_summary, w_drivers, w_net_expl = _rb_summarize(facts, label_policy, prev_vals)
+        except Exception as e:
+            w_summary = f"[RB_ERROR] {type(e).__name__}: {e}"
+            w_drivers = []
+            w_net_expl = ""
+        weekly_rb_by_date[d] = {
+            "date": d,
+            "summary": w_summary,
+            "drivers": w_drivers,
+            "net_effect": rec["net_effect"],
+            "net_explanation": w_net_expl,
+        }
+
+    # ---------- 3) Aggregate weekly + model context for the single LLM run ----------
+    extra_context_all: Dict[str, Any] = {}
+    dates_sorted = sorted(weekly_recs.keys())
+    per_week_ctx_list: List[Dict[str, Any]] = []
+    base_row_ctx: Optional[Dict[str, Any]] = None
+
+    for d in dates_sorted:
+        row_wrap = per_row_ctx_by_date.get(d, {})
+        model_ctx = row_wrap.get("model_context", {}) or {}
+        if base_row_ctx is None and model_ctx:
+            base_row_ctx = model_ctx
+
+        fw_val = row_wrap.get("forecast_week")
+        rb_week = weekly_rb_by_date.get(d, {})
+
+        entry: Dict[str, Any] = {
+            "date": d,
+            "forecast_week": fw_val,
+            "drivers": weekly_recs[d]["groups"],
+            "net_effect": weekly_recs[d]["net_effect"],
+            "weekly_summary_rb": rb_week.get("summary"),
+            "weekly_drivers_rb": rb_week.get("drivers"),
+            "weekly_net_explanation_rb": rb_week.get("net_explanation"),
+        }
+
+        mo_sum = model_ctx.get("model_outputs_summary")
+        if mo_sum:
+            entry["model_outputs_summary"] = mo_sum
+        shap_ctx = model_ctx.get("shap_context")
+        if shap_ctx:
+            entry["shap_context"] = shap_ctx
+
+        per_week_ctx_list.append(entry)
+
+    extra_context_all["per_week"] = per_week_ctx_list
+
+    if base_row_ctx:
+        if "model_details" in base_row_ctx:
+            extra_context_all["model_details"] = base_row_ctx["model_details"]
+        if "train_data" in base_row_ctx:
+            extra_context_all["train_data"] = base_row_ctx["train_data"]
+
+    # ---------- 4) Single LLM call at monthly level (uses all weeks via extra_context_all) ----------
+    monthly_flat, payload, llm_out, xai_text = run_xai_once(
+        weekly_flat_global,
+        extra_context=extra_context_all
+    )
+
+    if mode == "test":
+        if XAI_SHAP_AGG_MODE == "weekly":
+            print("\n=== SHAP_Weekly_Grouped (as-is) ===")
+        else:
+            print("\n=== MONTHLY MEAN JSON (flat) ===")
+        print(json.dumps(monthly_flat, indent=2))
+
+        print("\n=== LLM STRUCTURED JSON (normalized) ===")
+        print(json.dumps(llm_out, indent=2, ensure_ascii=False))
+
+        print("\n=== MONTHLY TEXT (LLM / XAI MESSAGE) ===")
+        print(xai_text)
+
+        print("\n=== WEEKLY RULE-BASED SUMMARIES (first few) ===")
+        for d in dates_sorted[:5]:
+            rb = weekly_rb_by_date.get(d, {})
+            print(f"- {d}: {rb.get('summary','')}")
+        if LAST_CALL_METRICS:
+            print("\n=== LLM METRICS ===")
+            print(json.dumps(LAST_CALL_METRICS, indent=2))
+        return None
+
+    # ---------- 5) Build output rows per forecast week ----------
+    records: List[Dict[str, Any]] = []
+    metrics = {**LAST_CALL_METRICS} if LAST_CALL_METRICS else {}
+    llm_model = metrics.get("model", DATABRICKS_MODEL)
+    llm_prompt_tokens = metrics.get("prompt_tokens_est")
+    llm_output_tokens = metrics.get("output_tokens_est")
+    llm_tps = metrics.get("tps_est")
+    llm_duration = metrics.get("duration_sec")
+    llm_schema_mode = metrics.get("schema")
+    llm_is_reasoning = metrics.get("is_reasoning_model", IS_REASONING_MODEL)
+
+    monthly_json_drivers = json.dumps(monthly_flat, separators=(',', ':'), ensure_ascii=False) \
+        if XAI_SHAP_AGG_MODE != "weekly" else ""
+    weekly_json_drivers = json.dumps(weekly_flat_global, separators=(',', ':'), ensure_ascii=False)
+
+    for _, row in df_in.iterrows():
+        row_date_str = _normalize_row_date(row)
+        fw_val = row[fw_col] if fw_col in row.index else None
+        rb_week = weekly_rb_by_date.get(row_date_str or "", {})
+
+        records.append({
+            "Date": row_date_str or row.get(date_col),
+            "Forecast_Week": fw_val,
+            "Weekly_JSON_Drivers": weekly_json_drivers,
+            "Monthly_JSON_Drivers": monthly_json_drivers,
+            "XAI_JSON_Params": json.dumps(llm_out, separators=(',', ':'), ensure_ascii=False)
+                              if XAI_SHAP_AGG_MODE != "weekly" else "",
+            "XAI_Explaination": xai_text,
+            # NEW: weekly rule-based layer per forecast week
+            "XAI_Weekly_JSON_RB": json.dumps(rb_week, separators=(',', ':'), ensure_ascii=False) if rb_week else "",
+            "XAI_Weekly_Summary_RB": rb_week.get("summary", ""),
+            # LLM metrics (same for all rows, since LLM is called once)
+            "LLM_Model": llm_model,
+            "LLM_Prompt_Tokens": llm_prompt_tokens,
+            "LLM_Output_Tokens": llm_output_tokens,
+            "LLM_TPS_Est": llm_tps,
+            "LLM_Duration_Sec": llm_duration,
+            "LLM_Schema_Mode": llm_schema_mode,
+            "LLM_Is_Reasoning_Model": llm_is_reasoning,
+            # Config flags for this run
+            "XAI_Include_Model_Outputs": bool(XAI_INCLUDE_MODEL_OUTPUTS),
+            "XAI_SHAP_Agg_Mode": XAI_SHAP_AGG_MODE,
+        })
+
+    out_df = pd.DataFrame.from_records(records)
+    out_df.to_excel(XAI_OUTPUT_XLS, index=False, engine="openpyxl")
+    if XAI_SAVE_METRICS and LLM_METRICS_LOG:
+        pd.DataFrame(LLM_METRICS_LOG).to_csv(XAI_METRICS_CSV, index=False)
+    print(f"[OK] Wrote results to {XAI_OUTPUT_XLS} ({len(out_df)} rows).")
+    if XAI_SAVE_METRICS and LLM_METRICS_LOG:
+        print(f"[OK] LLM metrics logged to {XAI_METRICS_CSV} ({len(LLM_METRICS_LOG)} events).")
+    return out_df
+
+# =========================
+# 9) MAIN
+# =========================
+def main():
+    try:
+        df = pd.read_excel(XAI_DATA_PATH, engine="openpyxl")
+    except Exception as e:
+        raise RuntimeError(f"Failed to read input Excel at {XAI_DATA_PATH}: {e}")
+
+    if RUN_MODE not in ("test","prod"):
+        print(f"[WARN] Unknown RUN_MODE={RUN_MODE}; defaulting to 'test'.")
+        mode = "test"
+    else:
+        mode = RUN_MODE
+
+    run_pipeline_from_df(df, mode=mode)
+
+if __name__ == "__main__":
+    main()
